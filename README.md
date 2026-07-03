@@ -1,12 +1,10 @@
-cd tr# trainerd
+# trainerd
 
-`trainerd` is a domain-neutral job runner.
+`trainerd` is a domain-neutral job runner. 
 
 It accepts caller-provided job payloads, resolves them through a config file,
 queues work, runs subprocess steps, stores status, streams logs, and optionally
 runs validation and promotion hooks.
-
-It does not know sports, betting, research metrics, or model semantics.
 
 ## Safety Note
 
