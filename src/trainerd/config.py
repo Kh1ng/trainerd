@@ -62,6 +62,7 @@ class TrainingConfig:
     server_port: int
     log_dir: Path
     max_concurrent_jobs: int = 1
+    required_env: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

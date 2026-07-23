@@ -10,9 +10,16 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .managed_env import (
+    ManagedEnvError,
+    load_managed_env,
+    set_managed_env,
+    unset_managed_env,
+)
 
 def _headers(api_key: str | None) -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
@@ -71,6 +78,58 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         state_dir=args.state_dir,
         max_concurrent_jobs=args.max_concurrent_jobs,
     )
+    return 0
+
+
+def _env_state_dir(value: str | None) -> Path:
+    if value:
+        return Path(value).expanduser().resolve()
+    from .lan import default_state_dir
+
+    return default_state_dir().expanduser().resolve()
+
+
+def _cmd_env_set(args: argparse.Namespace) -> int:
+    sources = sum(
+        (
+            args.value is not None,
+            args.from_env is not None,
+            bool(args.stdin),
+        )
+    )
+    if sources != 1:
+        raise ManagedEnvError(
+            "Choose exactly one value source: --value, --from-env, or --stdin"
+        )
+    if args.from_env is not None:
+        if args.from_env not in os.environ:
+            raise ManagedEnvError(
+                f"Source environment variable is not set: {args.from_env}"
+            )
+        value = os.environ[args.from_env]
+    elif args.stdin:
+        value = sys.stdin.read()
+        if value.endswith("\n"):
+            value = value[:-1]
+        if value.endswith("\r"):
+            value = value[:-1]
+    else:
+        value = args.value
+    set_managed_env(_env_state_dir(args.state_dir), args.name, value)
+    print(f"{args.name} configured")
+    return 0
+
+
+def _cmd_env_unset(args: argparse.Namespace) -> int:
+    existed = unset_managed_env(_env_state_dir(args.state_dir), args.name)
+    print(f"{args.name} {'removed' if existed else 'was not configured'}")
+    return 0
+
+
+def _cmd_env_list(args: argparse.Namespace) -> int:
+    values = load_managed_env(_env_state_dir(args.state_dir))
+    for name in sorted(values):
+        print(name)
     return 0
 
 
@@ -167,6 +226,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve.set_defaults(func=_cmd_serve)
 
+    env = sub.add_parser(
+        "env",
+        help="Manage persistent environment variables injected into opted-in LAN tasks.",
+    )
+    env.add_argument(
+        "--state-dir",
+        help="Managed LAN state directory (defaults to the same path as serve --lan).",
+    )
+    env_sub = env.add_subparsers(dest="env_command", required=True)
+    env_set = env_sub.add_parser("set", help="Store or replace one managed variable.")
+    env_set.add_argument("name")
+    value_source = env_set.add_mutually_exclusive_group(required=True)
+    value_source.add_argument("--value")
+    value_source.add_argument("--from-env")
+    value_source.add_argument("--stdin", action="store_true")
+    env_set.set_defaults(func=_cmd_env_set)
+    env_unset = env_sub.add_parser("unset", help="Remove one managed variable.")
+    env_unset.add_argument("name")
+    env_unset.set_defaults(func=_cmd_env_unset)
+    env_list = env_sub.add_parser(
+        "list",
+        help="List configured names without revealing values.",
+    )
+    env_list.set_defaults(func=_cmd_env_list)
+
     submit = sub.add_parser("submit", help="Submit a training job to a running trainerd server")
     submit.add_argument("--server-url", required=True)
     submit.add_argument("--api-key", default=os.environ.get("TRAINERD_API_KEY"))
@@ -224,3 +308,6 @@ def main(argv: list[str] | None = None) -> int:
     except urllib.error.URLError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    except ManagedEnvError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2

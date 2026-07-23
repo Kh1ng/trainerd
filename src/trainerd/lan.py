@@ -23,6 +23,7 @@ from .config import (
     TrainingConfig,
     ValidationConfig,
 )
+from .managed_env import ManagedEnvError, load_managed_env, validate_env_name
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -146,6 +147,7 @@ def prepare_lan_project(state_dir: Path, repo_url: str, task: str) -> LanPrepare
         work_dir=work_dir,
         log_dir=log_dir,
     )
+    inject_managed_env(config, state_dir)
     return LanPreparedProject(
         project=project,
         repo_url=normalized_url,
@@ -155,6 +157,26 @@ def prepare_lan_project(state_dir: Path, repo_url: str, task: str) -> LanPrepare
         manifest_path=resolved_manifest,
         config=config,
     )
+
+
+def inject_managed_env(config: TrainingConfig, state_dir: Path) -> None:
+    """Inject only the managed names explicitly requested by a LAN task."""
+    try:
+        managed_env = load_managed_env(state_dir)
+    except ManagedEnvError as exc:
+        raise LanConfigError(str(exc)) from exc
+    missing_env = [name for name in config.required_env if name not in managed_env]
+    if missing_env:
+        raise LanConfigError(
+            "Task requires managed environment variable(s): "
+            + ", ".join(missing_env)
+            + ". Configure them once with: trainerd env set NAME --from-env NAME"
+        )
+    selected_env = {name: managed_env[name] for name in config.required_env}
+    for step in config.steps:
+        step.env = {**step.env, **selected_env}
+    if config.validation is not None:
+        config.validation.env = {**config.validation.env, **selected_env}
 
 
 def load_lan_task(
@@ -192,7 +214,23 @@ def load_lan_task(
     task_raw = tasks[task]
     if not isinstance(task_raw, dict):
         raise LanConfigError(f"Task {task!r} must be a mapping")
-    _only_keys(task_raw, {"steps", "validation", "max_concurrent_jobs"}, f"task {task!r}")
+    _only_keys(
+        task_raw,
+        {"steps", "validation", "max_concurrent_jobs", "required_env"},
+        f"task {task!r}",
+    )
+    required_env_raw = task_raw.get("required_env", [])
+    if not isinstance(required_env_raw, list) or len(required_env_raw) > 64:
+        raise LanConfigError(f"task {task!r} required_env must be a list of at most 64 names")
+    required_env: list[str] = []
+    for raw_name in required_env_raw:
+        try:
+            name = validate_env_name(raw_name)
+        except ManagedEnvError as exc:
+            raise LanConfigError(f"task {task!r} required_env contains an invalid name") from exc
+        if name in required_env:
+            raise LanConfigError(f"task {task!r} required_env contains duplicate name {name}")
+        required_env.append(name)
     steps_raw = task_raw.get("steps")
     if not isinstance(steps_raw, list) or not steps_raw:
         raise LanConfigError(f"Task {task!r} requires a non-empty steps list")
@@ -237,6 +275,7 @@ def load_lan_task(
         server_port=7860,
         log_dir=log_dir.resolve(),
         max_concurrent_jobs=max_jobs,
+        required_env=tuple(required_env),
     )
 
 
