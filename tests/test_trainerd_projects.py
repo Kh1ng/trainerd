@@ -456,4 +456,7 @@ def test_cli_serve_passes_explicit_registry_and_listener() -> None:
         port=7861,
         projects_config="projects.yaml",
         config=None,
+        lan=False,
+        state_dir=None,
+        max_concurrent_jobs=None,
     )

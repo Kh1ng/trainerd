@@ -63,10 +63,13 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     from .server import main as serve_main
 
     serve_main(
-        host=args.host,
+        host=args.host or ("0.0.0.0" if args.lan else "127.0.0.1"),
         port=args.port,
         projects_config=args.projects_config,
         config=args.config,
+        lan=args.lan,
+        state_dir=args.state_dir,
+        max_concurrent_jobs=args.max_concurrent_jobs,
     )
     return 0
 
@@ -143,8 +146,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         help="Path to one project config for legacy single-project mode.",
     )
-    serve.add_argument("--host", default="127.0.0.1")
+    config_group.add_argument(
+        "--lan",
+        action="store_true",
+        help="Insecure zero-config LAN mode: clone HTTP Git repos and run repo-owned tasks.",
+    )
+    serve.add_argument(
+        "--host",
+        help="Listen address (default: 0.0.0.0 with --lan; otherwise 127.0.0.1).",
+    )
     serve.add_argument("--port", type=int, help="Override the configured listen port.")
+    serve.add_argument(
+        "--state-dir",
+        help="Managed LAN checkouts/jobs directory (only valid with --lan).",
+    )
+    serve.add_argument(
+        "--max-concurrent-jobs",
+        type=int,
+        help="Daemon-wide LAN concurrency (only valid with --lan; default: 1).",
+    )
     serve.set_defaults(func=_cmd_serve)
 
     submit = sub.add_parser("submit", help="Submit a training job to a running trainerd server")

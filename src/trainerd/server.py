@@ -32,6 +32,14 @@ from pydantic import BaseModel, ConfigDict, StrictBool, StrictStr
 
 from . import __version__
 from .config import ServerConfig, TrainingConfig, load_config, load_server_config
+from .lan import (
+    LanConfigError,
+    LanPreparedProject,
+    default_state_dir,
+    normalize_repo_url,
+    prepare_lan_project,
+    repo_key,
+)
 from .runner import JobRunner
 from .storage import JobStore, JobStatus
 
@@ -47,15 +55,20 @@ _config_path: Path | None = None
 @dataclass
 class ProjectRuntime:
     project: str
-    config_path: Path
+    config_path: Path | None
     config: TrainingConfig
     store: JobStore
     runner: JobRunner
+    lan_repo_key: str | None = None
 
 
 _server_config: ServerConfig | None = None
 _projects: dict[str, ProjectRuntime] = {}
 _default_project: str | None = None
+_lan_mode_active = False
+_lan_state_dir: Path | None = None
+_lan_max_concurrent_jobs = 1
+_lan_prepare_lock: asyncio.Lock | None = None
 
 # Queue worker state
 _queue_worker_task: asyncio.Task | None = None
@@ -69,6 +82,9 @@ class JobRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     project: StrictStr | None = None
+    repo: StrictStr | None = None
+    repo_url: StrictStr | None = None
+    task: StrictStr | None = None
     version: StrictStr | None = None
     steps: list[StrictStr] | None = None
     branch: StrictStr | None = None
@@ -124,6 +140,10 @@ def _is_registry_mode() -> bool:
     return bool(_server_config and _server_config.registry_mode)
 
 
+def _is_lan_mode() -> bool:
+    return _lan_mode_active
+
+
 def _select_runtime(project: Any = None) -> ProjectRuntime:
     requested = str(project) if project is not None else ""
     if not requested:
@@ -144,6 +164,11 @@ def _select_runtime(project: Any = None) -> ProjectRuntime:
 
 
 def _validate_multi_project_request(payload: dict[str, Any]) -> None:
+    if not _is_lan_mode() and any(field in payload for field in ("repo", "repo_url", "task")):
+        raise HTTPException(
+            status_code=400,
+            detail="repo and task are accepted only when trainerd starts with --lan",
+        )
     if not _is_registry_mode():
         return
     if "branch" in payload:
@@ -175,6 +200,8 @@ def _validate_multi_project_request(payload: dict[str, Any]) -> None:
 
 
 def _refresh_project_runtime(runtime: ProjectRuntime) -> TrainingConfig:
+    if runtime.config_path is None:
+        return runtime.config
     refreshed = load_config(runtime.config_path)
     if refreshed.project != runtime.project:
         raise RuntimeError(
@@ -267,7 +294,13 @@ def _recover_stale_jobs(store: JobStore) -> None:
 
 async def _queue_worker() -> None:
     """Poll all allowlisted queues without exceeding the daemon-wide cap."""
-    max_jobs = _server_config.max_concurrent_jobs if _server_config else (_config.max_concurrent_jobs if _config else 1)
+    max_jobs = (
+        _lan_max_concurrent_jobs
+        if _is_lan_mode()
+        else _server_config.max_concurrent_jobs
+        if _server_config
+        else (_config.max_concurrent_jobs if _config else 1)
+    )
     log.info("Queue worker started (max_concurrent_jobs=%s)", max_jobs)
     while True:
         try:
@@ -316,39 +349,71 @@ async def _run_job_wrapper(job_id: str, project: str | None = None) -> None:
 async def _lifespan(app: FastAPI):
     global _store, _runner, _config, _config_path, _queue_worker_task
     global _server_config, _projects, _default_project
-    _server_config = load_server_config()
-    _default_project = _server_config.default_project
+    global _lan_mode_active, _lan_state_dir, _lan_max_concurrent_jobs, _lan_prepare_lock
+    _lan_mode_active = os.environ.get("TRAINERD_LAN_MODE") == "1"
     _projects = {}
-    for configured in _server_config.projects.values():
-        store = JobStore(configured.config.log_dir / "jobs.db")
-        runner = JobRunner(store, configured.config, config_path=configured.config_path)
-        runtime = ProjectRuntime(
-            configured.project,
-            configured.config_path,
-            configured.config,
-            store,
-            runner,
+    if _lan_mode_active:
+        _server_config = None
+        _default_project = None
+        _store = None
+        _runner = None
+        _config = None
+        _config_path = None
+        configured_state = os.environ.get("TRAINERD_STATE_DIR", "").strip()
+        _lan_state_dir = (
+            Path(configured_state).expanduser().resolve()
+            if configured_state
+            else default_state_dir().expanduser().resolve()
         )
-        _projects[configured.project] = runtime
-    _validate_unique_job_ids(_projects)
-    for runtime in _projects.values():
-        _recover_stale_jobs(runtime.store)
+        _lan_state_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            _lan_max_concurrent_jobs = int(
+                os.environ.get("TRAINERD_MAX_CONCURRENT_JOBS", "1")
+            )
+        except ValueError as exc:
+            raise ValueError("TRAINERD_MAX_CONCURRENT_JOBS must be an integer") from exc
+        if not 1 <= _lan_max_concurrent_jobs <= 64:
+            raise ValueError("TRAINERD_MAX_CONCURRENT_JOBS must be from 1 to 64")
+        _lan_prepare_lock = asyncio.Lock()
+    else:
+        _server_config = load_server_config()
+        _default_project = _server_config.default_project
+        for configured in _server_config.projects.values():
+            store = JobStore(configured.config.log_dir / "jobs.db")
+            runner = JobRunner(store, configured.config, config_path=configured.config_path)
+            runtime = ProjectRuntime(
+                configured.project,
+                configured.config_path,
+                configured.config,
+                store,
+                runner,
+            )
+            _projects[configured.project] = runtime
+        _validate_unique_job_ids(_projects)
+        for runtime in _projects.values():
+            _recover_stale_jobs(runtime.store)
 
-    default_runtime = _projects[_default_project]
-    _config_path = default_runtime.config_path
-    _config = default_runtime.config
-    _store = default_runtime.store
-    _runner = default_runtime.runner
+        default_runtime = _projects[_default_project]
+        _config_path = default_runtime.config_path
+        _config = default_runtime.config
+        _store = default_runtime.store
+        _runner = default_runtime.runner
 
     # Start background queue worker
     _queue_worker_task = asyncio.create_task(_queue_worker())
 
-    log.info(
-        "Training server ready. Projects: %s  default=%s  max_concurrent_jobs=%s",
-        sorted(_projects),
-        _default_project,
-        _server_config.max_concurrent_jobs,
-    )
+    if _lan_mode_active:
+        log.warning(
+            "INSECURE LAN MODE enabled on managed state %s; authentication is disabled",
+            _lan_state_dir,
+        )
+    else:
+        log.info(
+            "Training server ready. Projects: %s  default=%s  max_concurrent_jobs=%s",
+            sorted(_projects),
+            _default_project,
+            _server_config.max_concurrent_jobs,
+        )
     yield
     log.info("Training server shutting down.")
     if _queue_worker_task:
@@ -364,6 +429,9 @@ async def _lifespan(app: FastAPI):
     _projects = {}
     _server_config = None
     _default_project = None
+    _lan_mode_active = False
+    _lan_state_dir = None
+    _lan_prepare_lock = None
 
 
 app = FastAPI(title="trainerd", version=__version__, lifespan=_lifespan)
@@ -385,7 +453,13 @@ async def health() -> dict:
     pending = sum(len(runtime.store.list_job_ids(status=JobStatus.PENDING)) for runtime in runtimes.values())
     running = sum(len(runtime.store.list_job_ids(status=JobStatus.RUNNING)) for runtime in runtimes.values())
     active = len(set().union(*_active_job_ids_by_project(runtimes).values()))
-    max_jobs = _server_config.max_concurrent_jobs if _server_config else (_config.max_concurrent_jobs if _config else 1)
+    max_jobs = (
+        _lan_max_concurrent_jobs
+        if _is_lan_mode()
+        else _server_config.max_concurrent_jobs
+        if _server_config
+        else (_config.max_concurrent_jobs if _config else 1)
+    )
     default = _default_project or (_config.project if _config else None)
     return {
         "status": "ok",
@@ -394,6 +468,7 @@ async def health() -> dict:
         "project": default,
         "projects": sorted(runtimes),
         "default_project": default,
+        "mode": "lan" if _is_lan_mode() else "registry" if _is_registry_mode() else "single",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "pending_jobs": pending,
         "running_jobs": running,
@@ -417,7 +492,10 @@ async def submit_job(body: JobRequest = JobRequest()) -> dict:
     """
     payload = body.model_dump(exclude_none=True)
     _validate_multi_project_request(payload)
-    runtime = _select_runtime(payload.get("project"))
+    if _is_lan_mode():
+        runtime, payload = await _prepare_lan_runtime(payload)
+    else:
+        runtime = _select_runtime(payload.get("project"))
     config = _refresh_project_runtime(runtime)
     store = runtime.store
     requested_steps = payload.get("steps")
@@ -475,6 +553,117 @@ async def submit_job(body: JobRequest = JobRequest()) -> dict:
         "steps": steps,
         "queued": True,
     }
+
+
+async def _prepare_lan_runtime(
+    payload: dict[str, Any],
+) -> tuple[ProjectRuntime, dict[str, Any]]:
+    """Resolve a bounded LAN request to a daemon-owned runtime."""
+    allowed = {"repo", "repo_url", "task", "version", "force", "triggered_by"}
+    unsupported = sorted(set(payload) - allowed)
+    if unsupported:
+        raise HTTPException(
+            status_code=400,
+            detail=f"LAN mode does not accept field(s): {', '.join(unsupported)}",
+        )
+    repo = payload.get("repo")
+    repo_url = payload.get("repo_url")
+    if repo is not None and repo_url is not None:
+        raise HTTPException(status_code=400, detail="Use repo; do not send both repo and repo_url")
+    selected_repo = repo if repo is not None else repo_url
+    if selected_repo is None:
+        raise HTTPException(status_code=400, detail="repo is required in LAN mode")
+    task = payload.get("task")
+    if task is None:
+        raise HTTPException(status_code=400, detail="task is required in LAN mode")
+    version = payload.get("version")
+    if version is not None and not _SAFE_JOB_TOKEN.fullmatch(version):
+        raise HTTPException(status_code=400, detail="version contains unsupported characters")
+    if _lan_state_dir is None:
+        raise HTTPException(status_code=503, detail="LAN state is not initialized")
+
+    lock = _lan_prepare_lock
+    if lock is None:
+        raise HTTPException(status_code=503, detail="LAN checkout manager is not initialized")
+    async with lock:
+        try:
+            normalized_repo = normalize_repo_url(selected_repo)
+            selected_key = repo_key(normalized_repo)
+            for existing_runtime in _projects.values():
+                if existing_runtime.lan_repo_key != selected_key:
+                    continue
+                if _lan_runtime_busy(existing_runtime):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="This repository already has pending or running work",
+                    )
+            prepared = await asyncio.to_thread(
+                prepare_lan_project,
+                _lan_state_dir,
+                normalized_repo,
+                task,
+            )
+        except LanConfigError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        runtime = _install_lan_runtime(prepared)
+
+    sanitized = {
+        key: value
+        for key, value in payload.items()
+        if key in {"version", "force", "triggered_by"}
+    }
+    sanitized["project"] = runtime.project
+    return runtime, sanitized
+
+
+def _install_lan_runtime(prepared: LanPreparedProject) -> ProjectRuntime:
+    """Install or refresh a fully prepared dynamic runtime."""
+    for runtime in _projects.values():
+        if runtime.lan_repo_key != prepared.repo_key:
+            continue
+        if _lan_runtime_busy(runtime):
+            raise HTTPException(
+                status_code=409,
+                detail="This repository already has pending or running work",
+            )
+
+    existing = _projects.get(prepared.project)
+    if existing is not None:
+        existing.config = prepared.config
+        existing.runner.update_config(prepared.config)
+        return existing
+
+    store = JobStore(prepared.config.log_dir / "jobs.db")
+    runner = JobRunner(store, prepared.config)
+    runtime = ProjectRuntime(
+        prepared.project,
+        None,
+        prepared.config,
+        store,
+        runner,
+        lan_repo_key=prepared.repo_key,
+    )
+    _recover_stale_jobs(store)
+    for job_id in store.list_job_ids():
+        found = _find_job_runtime(job_id)
+        if found is not None:
+            raise RuntimeError(f"Duplicate historical job id {job_id!r} in LAN state")
+    _projects[prepared.project] = runtime
+    global _default_project, _store, _runner, _config, _config_path
+    if _default_project is None:
+        _default_project = prepared.project
+        _store = store
+        _runner = runner
+        _config = prepared.config
+        _config_path = None
+    return runtime
+
+
+def _lan_runtime_busy(runtime: ProjectRuntime) -> bool:
+    """Keep checkout updates away from queued, running, and validating jobs."""
+    pending = runtime.store.list_job_ids(status=JobStatus.PENDING)
+    active = _active_job_ids_by_project({runtime.project: runtime})[runtime.project]
+    return bool(pending or active)
 
 
 @app.get("/api/jobs", dependencies=[Depends(_api_key_auth)])
@@ -639,18 +828,44 @@ def main(
     port: int | None = None,
     projects_config: str | None = None,
     config: str | None = None,
+    lan: bool = False,
+    state_dir: str | None = None,
+    max_concurrent_jobs: int | None = None,
 ) -> None:
-    if projects_config:
+    if not lan and (state_dir is not None or max_concurrent_jobs is not None):
+        raise ValueError("--state-dir and --max-concurrent-jobs require --lan")
+    if lan:
+        os.environ["TRAINERD_LAN_MODE"] = "1"
+        os.environ.pop("TRAINERD_PROJECTS_CONFIG", None)
+        os.environ.pop("TRAINING_CONFIG", None)
+        if state_dir:
+            os.environ["TRAINERD_STATE_DIR"] = str(Path(state_dir).expanduser().resolve())
+        else:
+            os.environ.pop("TRAINERD_STATE_DIR", None)
+        if max_concurrent_jobs is not None:
+            if not 1 <= max_concurrent_jobs <= 64:
+                raise ValueError("--max-concurrent-jobs must be from 1 to 64")
+            os.environ["TRAINERD_MAX_CONCURRENT_JOBS"] = str(max_concurrent_jobs)
+        else:
+            os.environ.pop("TRAINERD_MAX_CONCURRENT_JOBS", None)
+        server_port = 7860
+    elif projects_config:
+        os.environ.pop("TRAINERD_LAN_MODE", None)
         os.environ["TRAINERD_PROJECTS_CONFIG"] = str(Path(projects_config).resolve())
         os.environ.pop("TRAINING_CONFIG", None)
     elif config:
+        os.environ.pop("TRAINERD_LAN_MODE", None)
         os.environ["TRAINING_CONFIG"] = str(Path(config).resolve())
         os.environ.pop("TRAINERD_PROJECTS_CONFIG", None)
-    cfg = load_server_config()
+    else:
+        os.environ.pop("TRAINERD_LAN_MODE", None)
+    if not lan:
+        cfg = load_server_config()
+        server_port = cfg.server_port
     uvicorn.run(
         "trainerd.server:app",
         host=host,
-        port=port if port is not None else cfg.server_port,
+        port=port if port is not None else server_port,
         reload=False,
     )
 

@@ -1,8 +1,9 @@
 # trainerd
 
 `trainerd` is a standalone HTTP daemon for trusted, queued subprocess jobs. It
-loads an immutable project allowlist at startup, persists jobs and logs per
-project, and enforces daemon-wide and per-project concurrency limits.
+can run in zero-configuration LAN mode or load an immutable project allowlist,
+persists jobs and logs per project, and enforces daemon-wide and per-project
+concurrency limits.
 
 Clients submit a project ID and bounded job parameters. They cannot submit
 filesystem paths or command templates. No SSH access is needed for normal job
@@ -14,7 +15,7 @@ Python 3.10 or newer is required.
 
 ```bash
 python -m pip install \
-  "https://github.com/Kh1ng/trainerd/releases/download/v0.2.0/trainerd-0.2.0-py3-none-any.whl"
+  "https://github.com/Kh1ng/trainerd/releases/download/v0.2.1/trainerd-0.2.1-py3-none-any.whl"
 trainerd --version
 ```
 
@@ -24,6 +25,65 @@ For development:
 python -m pip install -e ".[dev]"
 python -m pytest
 ```
+
+## Zero-configuration LAN mode
+
+LAN mode is for a trusted private network where convenience matters more than
+authentication. Start the installed package with no registry, API key, project
+path, or SSH configuration:
+
+```powershell
+trainerd serve --lan
+```
+
+It listens on `0.0.0.0:7860`. On Windows, managed checkouts and job state
+default to `%PROGRAMDATA%\trainerd\state`; `--state-dir` can override this.
+
+Submit one anonymous HTTP request containing only the Git HTTP URL and the
+repository-owned task name:
+
+```powershell
+$body = @{
+  repo = "http://192.168.5.150/Khing/sportsball-bets.git"
+  task = "nfl-train"
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri http://127.0.0.1:7860/api/jobs `
+  -ContentType application/json `
+  -Body $body
+```
+
+The daemon clones or fast-forwards its own managed checkout and loads
+`.trainerd.yaml` from the repository root:
+
+```yaml
+version: 1
+tasks:
+  nfl-train:
+    max_concurrent_jobs: 1
+    steps:
+      - id: train
+        name: Train NFL models
+        cmd: 'py -3.12 -u scripts/trainerd_nfl_task.py --work-dir "{work_dir}"'
+        cwd: "."
+        timeout_seconds: 14400
+```
+
+Only anonymous `http://` and `https://` Git URLs are accepted. SSH/file URLs,
+URL credentials, client commands, and client filesystem paths are rejected.
+Task manifests are bounded and working directories cannot escape the daemon's
+managed checkout or work directory. The commands in `.trainerd.yaml` are still
+executable code from the repository.
+
+LAN mode runs at most one queued, running, or validating job per repository so
+that checkout updates cannot race repository-owned commands. The daemon-wide
+concurrency setting applies across different repositories.
+
+**LAN mode has no authentication. Anyone who can reach the port can run tasks
+from an HTTP Git repository. Keep it behind the host firewall on a trusted LAN.
+Use registry mode for any less-trusted network.**
 
 ## Run one daemon for multiple projects
 
@@ -118,13 +178,13 @@ commands and paths remain entirely server-owned.
 | Endpoint | Authentication | Purpose |
 |---|---:|---|
 | `GET /api/health` | No | Version, allowlist, queue, and capacity |
-| `POST /api/jobs` | API key | Submit a job |
-| `GET /api/jobs` | API key | List recent jobs |
-| `GET /api/jobs/{job_id}` | API key | Read job status |
-| `GET /api/jobs/{job_id}/logs` | API key | Tail or stream logs |
-| `DELETE /api/jobs/{job_id}` | API key | Cancel a queued/running job |
-| `POST /api/jobs/{job_id}/promote` | API key | Run a configured promotion hook |
-| `GET /api/models?project=...` | API key | Compatibility artifact listing |
+| `POST /api/jobs` | API key; none in LAN mode | Submit a job |
+| `GET /api/jobs` | API key; none in LAN mode | List recent jobs |
+| `GET /api/jobs/{job_id}` | API key; none in LAN mode | Read job status |
+| `GET /api/jobs/{job_id}/logs` | API key; none in LAN mode | Tail or stream logs |
+| `DELETE /api/jobs/{job_id}` | API key; none in LAN mode | Cancel a queued/running job |
+| `POST /api/jobs/{job_id}/promote` | API key; none in LAN mode | Run a configured promotion hook |
+| `GET /api/models?project=...` | API key; none in LAN mode | Compatibility artifact listing |
 
 Interactive OpenAPI documentation is available at `/docs`.
 
@@ -134,17 +194,17 @@ Install `trainerd` in a dedicated daemon virtual environment, separate from all
 project virtual environments:
 
 ```powershell
-py -3.12 -m venv C:\ProgramData\trainerd\venvs\0.2.0
-C:\ProgramData\trainerd\venvs\0.2.0\Scripts\python.exe -m pip install --upgrade pip
-C:\ProgramData\trainerd\venvs\0.2.0\Scripts\python.exe -m pip install `
-  https://github.com/Kh1ng/trainerd/releases/download/v0.2.0/trainerd-0.2.0-py3-none-any.whl
-C:\ProgramData\trainerd\venvs\0.2.0\Scripts\trainerd.exe --version
+py -3.12 -m venv C:\ProgramData\trainerd\venvs\0.2.1
+C:\ProgramData\trainerd\venvs\0.2.1\Scripts\python.exe -m pip install --upgrade pip
+C:\ProgramData\trainerd\venvs\0.2.1\Scripts\python.exe -m pip install `
+  https://github.com/Kh1ng/trainerd/releases/download/v0.2.1/trainerd-0.2.1-py3-none-any.whl
+C:\ProgramData\trainerd\venvs\0.2.1\Scripts\trainerd.exe --version
 ```
 
 Run this command from a Windows service wrapper or Scheduled Task:
 
 ```powershell
-C:\ProgramData\trainerd\venvs\0.2.0\Scripts\trainerd.exe serve `
+C:\ProgramData\trainerd\venvs\0.2.1\Scripts\trainerd.exe serve `
   --projects-config C:\ProgramData\trainerd\projects.yaml `
   --host 0.0.0.0 `
   --port 7860
