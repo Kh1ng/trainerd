@@ -43,7 +43,7 @@ jobs:
       - run: /tmp/trainerd-wheel-test/bin/python -m pip install dist/*.whl
       - run: /tmp/trainerd-wheel-test/bin/trainerd --version
       - run: /tmp/trainerd-wheel-test/bin/python -c "import trainerd; print(trainerd.__file__)"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: trainerd-distributions
           path: dist/*
