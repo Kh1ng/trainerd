@@ -15,6 +15,7 @@ from trainerd.lan import (
     LanPreparedProject,
     load_lan_task,
     normalize_repo_url,
+    repo_key,
 )
 
 
@@ -50,6 +51,8 @@ def _write_manifest(repo: Path, *, cwd: str = ".") -> Path:
 
 
 def _prepared(tmp_path: Path) -> LanPreparedProject:
+    repo_url = "http://git.local/team/repo.git"
+    key = repo_key(normalize_repo_url(repo_url))
     repo_path = tmp_path / "managed-repo"
     repo_path.mkdir()
     manifest_path = _write_manifest(repo_path)
@@ -60,8 +63,8 @@ def _prepared(tmp_path: Path) -> LanPreparedProject:
     config = load_lan_task(
         manifest_path,
         task="nfl-train",
-        project="lan-abc-nfl-train",
-        repo_url="http://git.local/team/repo.git",
+        project=f"lan-{key}-nfl-train",
+        repo_url=repo_url,
         repo_path=repo_path,
         branch="main",
         work_dir=work_dir,
@@ -70,7 +73,7 @@ def _prepared(tmp_path: Path) -> LanPreparedProject:
     return LanPreparedProject(
         project=config.project,
         repo_url=config.repo.url,
-        repo_key="abc",
+        repo_key=key,
         task="nfl-train",
         repo_path=repo_path,
         manifest_path=manifest_path,
