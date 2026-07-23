@@ -592,11 +592,7 @@ async def _prepare_lan_runtime(
             for existing_runtime in _projects.values():
                 if existing_runtime.lan_repo_key != selected_key:
                     continue
-                active = (
-                    existing_runtime.store.list_job_ids(status=JobStatus.PENDING)
-                    + existing_runtime.store.list_job_ids(status=JobStatus.RUNNING)
-                )
-                if active:
+                if _lan_runtime_busy(existing_runtime):
                     raise HTTPException(
                         status_code=409,
                         detail="This repository already has pending or running work",
@@ -625,11 +621,7 @@ def _install_lan_runtime(prepared: LanPreparedProject) -> ProjectRuntime:
     for runtime in _projects.values():
         if runtime.lan_repo_key != prepared.repo_key:
             continue
-        active = (
-            runtime.store.list_job_ids(status=JobStatus.PENDING)
-            + runtime.store.list_job_ids(status=JobStatus.RUNNING)
-        )
-        if active:
+        if _lan_runtime_busy(runtime):
             raise HTTPException(
                 status_code=409,
                 detail="This repository already has pending or running work",
@@ -665,6 +657,13 @@ def _install_lan_runtime(prepared: LanPreparedProject) -> ProjectRuntime:
         _config = prepared.config
         _config_path = None
     return runtime
+
+
+def _lan_runtime_busy(runtime: ProjectRuntime) -> bool:
+    """Keep checkout updates away from queued, running, and validating jobs."""
+    pending = runtime.store.list_job_ids(status=JobStatus.PENDING)
+    active = _active_job_ids_by_project({runtime.project: runtime})[runtime.project]
+    return bool(pending or active)
 
 
 @app.get("/api/jobs", dependencies=[Depends(_api_key_auth)])

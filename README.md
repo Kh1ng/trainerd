@@ -77,6 +77,10 @@ Task manifests are bounded and working directories cannot escape the daemon's
 managed checkout or work directory. The commands in `.trainerd.yaml` are still
 executable code from the repository.
 
+LAN mode runs at most one queued, running, or validating job per repository so
+that checkout updates cannot race repository-owned commands. The daemon-wide
+concurrency setting applies across different repositories.
+
 **LAN mode has no authentication. Anyone who can reach the port can run tasks
 from an HTTP Git repository. Keep it behind the host firewall on a trusted LAN.
 Use registry mode for any less-trusted network.**

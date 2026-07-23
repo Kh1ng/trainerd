@@ -4,6 +4,6 @@ tasks:
     steps:
       - id: run
         name: Run the repository-owned example
-        cmd: 'python examples/hello_job.py'
+        cmd: 'py -3.12 examples/hello_job.py'
         cwd: "."
         timeout_seconds: 60

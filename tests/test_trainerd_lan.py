@@ -149,6 +149,29 @@ def test_lan_manifest_rejects_cwd_escape_and_unknown_fields(tmp_path: Path) -> N
         )
 
 
+def test_lan_manifest_rejects_non_utf8_as_client_error(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    manifest = repo / ".trainerd.yaml"
+    manifest.write_bytes(b"\xff\xfe")
+    work = tmp_path / "state" / "work"
+    logs = tmp_path / "state" / "logs"
+    work.mkdir(parents=True)
+    logs.mkdir(parents=True)
+
+    with pytest.raises(LanConfigError, match="Could not read"):
+        load_lan_task(
+            manifest,
+            task="nfl-train",
+            project="lan-test",
+            repo_url="http://git.local/team/repo.git",
+            repo_path=repo,
+            branch="main",
+            work_dir=work,
+            log_dir=logs,
+        )
+
+
 def test_cli_lan_mode_has_zero_config_listener_defaults() -> None:
     with patch("trainerd.server.main") as serve:
         rc = trainerd_main(["serve", "--lan"])
@@ -210,8 +233,25 @@ def test_lan_post_repo_and_task_installs_runtime_and_queues_job(tmp_path: Path) 
         assert result["steps"] == ["train"]
         assert result["queued"] is True
         prepare.assert_called_once()
-        assert server._projects[prepared.project].store.get_job(result["job_id"])
+        runtime = server._projects[prepared.project]
+        assert runtime.store.get_job(result["job_id"])
         assert client.get("/api/health").json()["mode"] == "lan"
+
+        # A runner marks the row completed before its validation subprocess
+        # returns. Its task reservation must still block a checkout pull.
+        runtime.store.set_completed(result["job_id"])
+        server._running_tasks[result["job_id"]] = object()  # type: ignore[assignment]
+        with patch("trainerd.server.prepare_lan_project") as prepare_again:
+            validating = client.post(
+                "/api/jobs",
+                json={
+                    "repo": "http://git.local/team/repo.git",
+                    "task": "nfl-train",
+                },
+            )
+        assert validating.status_code == 409
+        prepare_again.assert_not_called()
+        server._running_tasks.pop(result["job_id"], None)
 
         incompatible = client.post(
             "/api/jobs",

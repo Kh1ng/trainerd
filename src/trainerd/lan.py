@@ -171,7 +171,7 @@ def load_lan_task(
     """Parse the strict repository-owned LAN task manifest."""
     try:
         raw = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError) as exc:
+    except (OSError, yaml.YAMLError, UnicodeDecodeError) as exc:
         raise LanConfigError(f"Could not read .trainerd.yaml: {exc}") from exc
     if not isinstance(raw, dict):
         raise LanConfigError(".trainerd.yaml must be a mapping")
