@@ -15,7 +15,7 @@ Python 3.10 or newer is required.
 
 ```bash
 python -m pip install \
-  "https://github.com/Kh1ng/trainerd/releases/download/v0.2.1/trainerd-0.2.1-py3-none-any.whl"
+  "https://github.com/Kh1ng/trainerd/releases/download/v0.3.0/trainerd-0.3.0-py3-none-any.whl"
 trainerd --version
 ```
 
@@ -62,6 +62,8 @@ The daemon clones or fast-forwards its own managed checkout and loads
 version: 1
 tasks:
   nfl-train:
+    required_env:
+      - NFL_DATABASE_URL
     max_concurrent_jobs: 1
     steps:
       - id: train
@@ -70,6 +72,20 @@ tasks:
         cwd: "."
         timeout_seconds: 14400
 ```
+
+Persistent job environment is configured once on the worker. Values are stored
+under trainerd's managed state, are never printed by `env list`, and are
+injected only into tasks that opt in with `required_env`:
+
+```powershell
+$env:NFL_DATABASE_URL = "postgresql://user:password@database/nfl"
+trainerd env set NFL_DATABASE_URL --from-env NFL_DATABASE_URL
+Remove-Item Env:NFL_DATABASE_URL
+trainerd env list
+```
+
+Changing a stored value does not require restarting the daemon; it is loaded
+when the next LAN task is prepared.
 
 Only anonymous `http://` and `https://` Git URLs are accepted. SSH/file URLs,
 URL credentials, client commands, and client filesystem paths are rejected.
@@ -194,17 +210,17 @@ Install `trainerd` in a dedicated daemon virtual environment, separate from all
 project virtual environments:
 
 ```powershell
-py -3.12 -m venv C:\ProgramData\trainerd\venvs\0.2.1
-C:\ProgramData\trainerd\venvs\0.2.1\Scripts\python.exe -m pip install --upgrade pip
-C:\ProgramData\trainerd\venvs\0.2.1\Scripts\python.exe -m pip install `
-  https://github.com/Kh1ng/trainerd/releases/download/v0.2.1/trainerd-0.2.1-py3-none-any.whl
-C:\ProgramData\trainerd\venvs\0.2.1\Scripts\trainerd.exe --version
+py -3.12 -m venv C:\ProgramData\trainerd\venvs\0.3.0
+C:\ProgramData\trainerd\venvs\0.3.0\Scripts\python.exe -m pip install --upgrade pip
+C:\ProgramData\trainerd\venvs\0.3.0\Scripts\python.exe -m pip install `
+  https://github.com/Kh1ng/trainerd/releases/download/v0.3.0/trainerd-0.3.0-py3-none-any.whl
+C:\ProgramData\trainerd\venvs\0.3.0\Scripts\trainerd.exe --version
 ```
 
 Run this command from a Windows service wrapper or Scheduled Task:
 
 ```powershell
-C:\ProgramData\trainerd\venvs\0.2.1\Scripts\trainerd.exe serve `
+C:\ProgramData\trainerd\venvs\0.3.0\Scripts\trainerd.exe serve `
   --projects-config C:\ProgramData\trainerd\projects.yaml `
   --host 0.0.0.0 `
   --port 7860
