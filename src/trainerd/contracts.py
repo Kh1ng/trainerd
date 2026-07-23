@@ -15,6 +15,11 @@ JOB_PAYLOAD_SCHEMA: dict[str, Any] = {
         # Optional startup-allowlisted project identifier. Clients never send
         # config paths or commands; omission preserves single-project clients.
         "project": {"type": "string"},
+        # Explicitly insecure LAN mode resolves these to a daemon-owned checkout
+        # and a repository-owned `.trainerd.yaml` task.
+        "repo": {"type": "string"},
+        "repo_url": {"type": "string"},
+        "task": {"type": "string"},
         # Opaque run label. "cv_v42" means nothing to trainerd; it is only
         # substituted into {version} slots in step command templates.
         "version": {"type": "string"},
