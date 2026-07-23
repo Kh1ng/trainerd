@@ -110,5 +110,6 @@ def test_with_repo_pythonpath_prepends_repo_path() -> None:
 
 
 def test_with_repo_pythonpath_dedupes_repo_path() -> None:
-    env = _with_repo_pythonpath("/repo", {"PYTHONPATH": "/repo:/other"})
-    assert env["PYTHONPATH"] == "/repo:/other"
+    existing = os.pathsep.join(["/repo", "/other"])
+    env = _with_repo_pythonpath("/repo", {"PYTHONPATH": existing})
+    assert env["PYTHONPATH"] == existing

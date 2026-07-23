@@ -72,8 +72,6 @@ def test_run_cmd_requests_new_session_on_posix(monkeypatch):
 def test_cancel_uses_process_group_termination(monkeypatch):
     import trainerd.runner as runner
 
-    killed = []
-
     class Process:
         pid = 5678
         returncode = None
@@ -82,6 +80,23 @@ def test_cancel_uses_process_group_termination(monkeypatch):
             self.returncode = 0
             return 0
 
-    monkeypatch.setattr(runner.os, "killpg", lambda pid, sig: killed.append((pid, sig)))
+    if runner.os.name == "nt":
+        calls = []
+        monkeypatch.setattr(
+            runner.subprocess,
+            "run",
+            lambda args, **kwargs: calls.append((args, kwargs)),
+        )
+        assert asyncio.run(runner._terminate_proc_tree(Process())) is True
+        assert calls[0][0] == ["taskkill", "/F", "/T", "/PID", "5678"]
+        assert calls[0][1]["check"] is False
+        return
+
+    killed = []
+    monkeypatch.setattr(
+        runner.os,
+        "killpg",
+        lambda pid, sig: killed.append((pid, sig)),
+    )
     assert asyncio.run(runner._terminate_proc_tree(Process())) is True
     assert killed == [(5678, runner.signal.SIGTERM)]
