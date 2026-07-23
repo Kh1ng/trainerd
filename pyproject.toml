@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trainerd"
+version = "0.2.0"
+description = "Allowlisted HTTP job runner for trusted, queued subprocess workloads"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Kh1ng" },
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Framework :: FastAPI",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Distributed Computing",
+]
+dependencies = [
+  "fastapi>=0.111,<1",
+  "pydantic>=2,<3",
+  "uvicorn>=0.29,<1",
+  "PyYAML>=6.0,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2,<2",
+  "httpx>=0.28,<1",
+  "pytest>=8.3,<9",
+  "twine>=5,<7",
+]
+
+[project.scripts]
+trainerd = "trainerd.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Kh1ng/trainerd"
+Repository = "https://github.com/Kh1ng/trainerd"
+Issues = "https://github.com/Kh1ng/trainerd/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+pythonpath = ["src"]

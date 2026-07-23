@@ -1,0 +1,12 @@
+# Optional multi-project startup registry. The daemon loads this file once and
+# accepts only these project ids; clients never provide config paths.
+default_project: project-a
+api_key: "${TRAINING_SERVER_API_KEY}"
+max_concurrent_jobs: 1
+server:
+  port: 7860
+projects:
+  project-a:
+    config: "./project_a_config.yaml"
+  project-b:
+    config: "./project_b_config.yaml"

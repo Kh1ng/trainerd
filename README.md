@@ -1,108 +1,196 @@
 # trainerd
 
-`trainerd` is a domain-neutral job runner. 
+`trainerd` is a standalone HTTP daemon for trusted, queued subprocess jobs. It
+loads an immutable project allowlist at startup, persists jobs and logs per
+project, and enforces daemon-wide and per-project concurrency limits.
 
-It accepts caller-provided job payloads, resolves them through a config file,
-queues work, runs subprocess steps, stores status, streams logs, and optionally
-runs validation and promotion hooks.
+Clients submit a project ID and bounded job parameters. They cannot submit
+filesystem paths or command templates. No SSH access is needed for normal job
+submission, status, logs, cancellation, or promotion.
 
-## Safety Note
+## Install
 
-`trainerd` runs caller-provided commands from config and payload substitutions.
-Treat it like a remote execution service for trusted repos and trusted configs.
-Do not expose it to untrusted users or unreviewed command templates.
-
-## Quickstart
-
-Install:
+Python 3.10 or newer is required.
 
 ```bash
-pip install -e .[dev]
+python -m pip install \
+  "https://github.com/Kh1ng/trainerd/releases/download/v0.2.0/trainerd-0.2.0-py3-none-any.whl"
+trainerd --version
 ```
 
-Run the server:
+For development:
 
 ```bash
-TRAINING_CONFIG=./examples/trainerd/sleep_job_config.yaml trainerd serve
+python -m pip install -e ".[dev]"
+python -m pytest
 ```
 
-Submit a job:
+## Run one daemon for multiple projects
+
+Create a server-owned registry:
+
+```yaml
+# projects.yaml
+default_project: project-a
+api_key: "${TRAINING_SERVER_API_KEY}"
+max_concurrent_jobs: 2
+server:
+  port: 7860
+projects:
+  project-a:
+    config: "./project_a.yaml"
+  project-b:
+    config: "./project_b.yaml"
+```
+
+Each allowlisted project has its own command configuration:
+
+```yaml
+# project_a.yaml
+project: project-a
+repo:
+  local_path: "${PROJECT_A_REPO_PATH}"
+work_dir: "${PROJECT_A_WORK_PATH}"
+log_dir: "${PROJECT_A_LOG_PATH}"
+max_concurrent_jobs: 1
+steps:
+  - id: pull
+    name: Update checkout
+    cmd: "git pull --ff-only origin {branch}"
+    timeout_seconds: 300
+  - id: run
+    name: Run workload
+    cmd: ".venv/Scripts/python.exe scripts/run_job.py --version {version}"
+    timeout_seconds: 14400
+```
+
+Start the daemon:
 
 ```bash
-trainerd submit --server-url http://127.0.0.1:7860 --version demo-v1
+export TRAINING_SERVER_API_KEY='replace-with-a-long-random-secret'
+export PROJECT_A_REPO_PATH='/srv/project-a'
+export PROJECT_A_WORK_PATH='/var/lib/trainerd/project-a'
+export PROJECT_A_LOG_PATH='/var/log/trainerd/project-a'
+
+trainerd serve \
+  --projects-config ./projects.yaml \
+  --host 0.0.0.0 \
+  --port 7860
 ```
 
-Watch a job:
+Registry mode fails closed if an environment variable, API key, config path, or
+project identity is invalid. Each project must use a distinct `log_dir`, which
+owns that project's SQLite database and job logs.
+
+## Submit work over HTTP
+
+The CLI reads `TRAINERD_API_KEY`, so the secret does not need to appear in the
+command line:
 
 ```bash
-trainerd watch --server-url http://127.0.0.1:7860 --job-id <job-id> --logs
+export TRAINERD_API_KEY="$TRAINING_SERVER_API_KEY"
+
+trainerd submit \
+  --server-url http://training-node:7860 \
+  --project project-a \
+  --steps pull,run \
+  --version v42 \
+  --wait \
+  --logs
 ```
 
-## API Overview
-
-| Endpoint | Purpose |
-|---|---|
-| `GET /api/health` | health and queue status |
-| `POST /api/jobs` | submit a job |
-| `GET /api/jobs` | list recent jobs |
-| `GET /api/jobs/{job_id}` | inspect one job |
-| `GET /api/jobs/{job_id}/logs` | stream or tail logs |
-| `DELETE /api/jobs/{job_id}` | cancel pending/running job |
-| `POST /api/jobs/{job_id}/promote` | manually trigger promotion |
-| `GET /api/models` | list promoted model directories from the configured repo |
-
-## Job Payload Example
-
-```json
-{
-  "version": "v42",
-  "steps": ["pull", "train"],
-  "branch": "main",
-  "markets": "task_a,task_b",
-  "extra_args": "--flag value",
-  "force": false,
-  "triggered_by": "cli"
-}
-```
-
-All fields are optional. `version`, `markets`, and `extra_args` are opaque
-strings to `trainerd`.
-
-## Artifact Manifest Example
-
-```json
-{
-  "run_label": "v42",
-  "job_id": "abcd1234",
-  "produced_at": "2026-07-03T06:00:00Z",
-  "artifacts": [
-    {
-      "path": "artifacts/output.txt",
-      "sha256": "abc123",
-      "bytes": 42
-    }
-  ]
-}
-```
-
-## Local Dev
-
-Run tests:
+The equivalent request is:
 
 ```bash
-python -m pytest -q tests/test_trainerd_contracts.py tests/test_training_server.py tests/test_trainerd_runner.py tests/test_training_pipeline_smoke.py
+curl --fail-with-body \
+  -H "X-API-Key: $TRAINING_SERVER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"project":"project-a","steps":["pull","run"],"version":"v42"}' \
+  http://training-node:7860/api/jobs
 ```
 
-Compile-check:
+Registry-mode requests must include `project`. They may select only configured
+step IDs. `branch` and arbitrary `extra_args` are rejected in registry mode;
+commands and paths remain entirely server-owned.
+
+## API
+
+| Endpoint | Authentication | Purpose |
+|---|---:|---|
+| `GET /api/health` | No | Version, allowlist, queue, and capacity |
+| `POST /api/jobs` | API key | Submit a job |
+| `GET /api/jobs` | API key | List recent jobs |
+| `GET /api/jobs/{job_id}` | API key | Read job status |
+| `GET /api/jobs/{job_id}/logs` | API key | Tail or stream logs |
+| `DELETE /api/jobs/{job_id}` | API key | Cancel a queued/running job |
+| `POST /api/jobs/{job_id}/promote` | API key | Run a configured promotion hook |
+| `GET /api/models?project=...` | API key | Compatibility artifact listing |
+
+Interactive OpenAPI documentation is available at `/docs`.
+
+## Windows daemon
+
+Install `trainerd` in a dedicated daemon virtual environment, separate from all
+project virtual environments:
+
+```powershell
+py -3.12 -m venv C:\ProgramData\trainerd\venvs\0.2.0
+C:\ProgramData\trainerd\venvs\0.2.0\Scripts\python.exe -m pip install --upgrade pip
+C:\ProgramData\trainerd\venvs\0.2.0\Scripts\python.exe -m pip install `
+  https://github.com/Kh1ng/trainerd/releases/download/v0.2.0/trainerd-0.2.0-py3-none-any.whl
+C:\ProgramData\trainerd\venvs\0.2.0\Scripts\trainerd.exe --version
+```
+
+Run this command from a Windows service wrapper or Scheduled Task:
+
+```powershell
+C:\ProgramData\trainerd\venvs\0.2.0\Scripts\trainerd.exe serve `
+  --projects-config C:\ProgramData\trainerd\projects.yaml `
+  --host 0.0.0.0 `
+  --port 7860
+```
+
+Project step commands may invoke each project's own virtual environment. Only
+the daemon itself belongs in the dedicated `trainerd` environment. A normal
+upgrade installs a new versioned daemon environment, validates it on an
+alternate port, then switches the service action; the old environment remains
+available for rollback.
+
+## Legacy single-project mode
+
+For an existing trusted config, run:
 
 ```bash
-python -m py_compile trainerd/*.py training_server/*.py
+trainerd serve --config ./training_config.yaml
 ```
 
-## Package Contents
+This compatibility mode permits the older optional `branch` and `extra_args`
+payload fields. Prefer registry mode for any network-accessible daemon.
 
-- `trainerd/`: package code
-- `training_server/`: temporary compatibility shim for legacy import paths
-- `examples/trainerd/`: minimal configs and scripts
-- `.github/workflows/trainerd.yml`: draft CI for the extracted repo
+## Security boundary
 
+Project configs contain executable command templates. Treat them as code and
+review them before deployment. Bind to loopback unless remote access is
+required; when exposed on a network, use registry mode, a strong API key, host
+firewall rules, and TLS at a reverse proxy or private overlay network.
+
+`trainerd` does not accept config paths or raw commands over HTTP. It
+constant-time compares API keys, authenticates logs, validates project and
+step identifiers, and starts with CORS disabled.
+
+## Build and test
+
+```bash
+python -m pytest
+python -m build
+python -m twine check dist/*
+```
+
+CI runs the suite on Linux and Windows, builds both wheel and source
+distribution, installs the wheel into a clean environment, and smoke-tests the
+CLI and import path.
+
+## License
+
+No license has been granted for redistribution or modification. The repository
+is source-available pending an explicit license decision.

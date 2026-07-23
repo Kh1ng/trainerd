@@ -1,0 +1,11 @@
+project: trainerd-example-sleep
+repo:
+  local_path: .
+work_dir: ./examples/work
+log_dir: ./examples/logs
+server:
+  port: 7860
+steps:
+  - id: sleep
+    name: Sleep
+    cmd: "python ./examples/sleep_job.py"

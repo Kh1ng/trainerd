@@ -1,0 +1,11 @@
+project: trainerd-example-python
+repo:
+  local_path: .
+work_dir: ./examples/work
+log_dir: ./examples/logs
+server:
+  port: 7860
+steps:
+  - id: run_script
+    name: Run Python Script
+    cmd: "python ./examples/hello_job.py --version {version} {extra_args}"

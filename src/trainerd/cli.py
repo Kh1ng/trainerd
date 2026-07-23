@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import sys
 import time
@@ -10,6 +11,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any
+
+from . import __version__
 
 def _headers(api_key: str | None) -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
@@ -59,12 +62,19 @@ def _compose_extra_args(args: argparse.Namespace) -> str:
 def _cmd_serve(args: argparse.Namespace) -> int:
     from .server import main as serve_main
 
-    serve_main()
+    serve_main(
+        host=args.host,
+        port=args.port,
+        projects_config=args.projects_config,
+        config=args.config,
+    )
     return 0
 
 
 def _cmd_submit(args: argparse.Namespace) -> int:
     payload: dict[str, Any] = {"triggered_by": args.triggered_by}
+    if args.project:
+        payload["project"] = args.project
     if args.version and str(args.version).strip().lower() != "auto":
         payload["version"] = args.version
     if args.steps:
@@ -120,14 +130,30 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="trainerd")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     serve = sub.add_parser("serve", help="Run the training orchestration API server")
+    config_group = serve.add_mutually_exclusive_group()
+    config_group.add_argument(
+        "--projects-config",
+        help="Path to a startup allowlist for multi-project registry mode.",
+    )
+    config_group.add_argument(
+        "--config",
+        help="Path to one project config for legacy single-project mode.",
+    )
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, help="Override the configured listen port.")
     serve.set_defaults(func=_cmd_serve)
 
     submit = sub.add_parser("submit", help="Submit a training job to a running trainerd server")
     submit.add_argument("--server-url", required=True)
-    submit.add_argument("--api-key")
+    submit.add_argument("--api-key", default=os.environ.get("TRAINERD_API_KEY"))
+    submit.add_argument(
+        "--project",
+        help="Startup-allowlisted project id (required in registry mode).",
+    )
     submit.add_argument("--version", help="Optional. Omit or pass 'auto' to use the server's next vN.")
     submit.add_argument("--steps", help="Comma-separated subset of step ids to run")
     submit.add_argument("--branch", help="Override the git branch for the pull step")
@@ -155,7 +181,7 @@ def build_parser() -> argparse.ArgumentParser:
     watch = sub.add_parser("watch", help="Poll job status from a running trainerd server")
     watch.add_argument("--server-url", required=True)
     watch.add_argument("--job-id", required=True)
-    watch.add_argument("--api-key")
+    watch.add_argument("--api-key", default=os.environ.get("TRAINERD_API_KEY"))
     watch.add_argument("--poll-seconds", type=int, default=15)
     watch.add_argument("--logs", action="store_true")
     watch.add_argument("--log-chars", type=int, default=4000)

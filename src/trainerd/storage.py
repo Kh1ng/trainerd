@@ -109,6 +109,18 @@ class JobStore:
             out.append(d)
         return out
 
+    def list_job_ids(self, status: str | None = None) -> list[str]:
+        """Return persisted job ids, optionally filtered by status."""
+        with self._connect() as conn:
+            if status:
+                rows = conn.execute(
+                    "SELECT job_id FROM jobs WHERE status = ?",
+                    (status,),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT job_id FROM jobs").fetchall()
+        return [str(row["job_id"]) for row in rows]
+
     def update_job(self, job_id: str, **kwargs: Any) -> None:
         if not kwargs:
             return

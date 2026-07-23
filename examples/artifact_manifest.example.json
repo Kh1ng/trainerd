@@ -1,0 +1,12 @@
+{
+  "run_label": "demo-v1",
+  "job_id": "abcd1234",
+  "produced_at": "2026-07-03T06:00:00Z",
+  "artifacts": [
+    {
+      "path": "examples/work/demo-v1/result.json",
+      "sha256": "replace-me",
+      "bytes": 72
+    }
+  ]
+}
