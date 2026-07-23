@@ -35,7 +35,7 @@ dependencies = [
 dev = [
   "build>=1.2,<2",
   "httpx>=0.28,<1",
-  "pytest>=8.3,<9",
+  "pytest>=8.3,<10",
   "twine>=5,<7",
 ]
 
