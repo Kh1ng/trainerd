@@ -1,0 +1,10 @@
+project: project-b
+repo:
+  local_path: .
+work_dir: ./examples/work/project-b
+log_dir: ./examples/logs/project-b
+max_concurrent_jobs: 1
+steps:
+  - id: sleep
+    name: Sleep
+    cmd: "python ./examples/sleep_job.py"

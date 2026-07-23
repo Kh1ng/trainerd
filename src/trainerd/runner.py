@@ -34,10 +34,18 @@ class JobRunner:
         self._store = store
         self._config = config
         self._config_path = config_path
+        # TrainingConfig always has project. getattr preserves lightweight
+        # test/embedding stubs that only exercise promotion helpers.
+        self._project = getattr(config, "project", None)
         # Track running subprocesses for cancellation: job_id -> asyncio.subprocess.Process | None
         self._running_procs: dict[str, asyncio.subprocess.Process | None] = {}
 
     def update_config(self, config: TrainingConfig, *, config_path: Path | None = None) -> None:
+        if self._project is not None and config.project != self._project:
+            raise ValueError(
+                f"Refusing to change runner project from {self._project!r} "
+                f"to {config.project!r}"
+            )
         self._config = config
         if config_path is not None:
             self._config_path = config_path
@@ -50,7 +58,13 @@ class JobRunner:
     def _load_current_config(self) -> TrainingConfig:
         if self._config_path is None:
             return self._config
-        self._config = load_config(self._config_path)
+        refreshed = load_config(self._config_path)
+        if self._project is not None and refreshed.project != self._project:
+            raise ValueError(
+                f"Configured project changed from {self._project!r} "
+                f"to {refreshed.project!r}"
+            )
+        self._config = refreshed
         return self._config
 
     async def run_job(self, job_id: str) -> None:
@@ -240,6 +254,7 @@ def _resolve_template(
         .replace("{version}", version)
         .replace("{repo_path}", repo_path)
         .replace("{work_dir}", work_dir)
+        .replace("{branch}", branch)
         .replace("{markets_flag}", f"--markets {markets}" if markets else "")
         .replace("{extra_args}", extra_args)
     )
@@ -311,11 +326,13 @@ async def _run_cmd(
         if proc_store is not None and job_id is not None:
             proc_store[job_id] = proc
         try:
-            async with asyncio.timeout(timeout):
+            async def _drain_stdout() -> None:
                 async for line in proc.stdout:  # type: ignore[union-attr]
                     decoded = line.decode("utf-8", errors="replace").rstrip()
                     logfile.write(decoded + "\n")
                     logfile.flush()
+
+            await asyncio.wait_for(_drain_stdout(), timeout=timeout)
         except asyncio.TimeoutError:
             await _terminate_proc_tree(proc)
             logfile.write(f"\n[TIMEOUT after {timeout}s]\n")

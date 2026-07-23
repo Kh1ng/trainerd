@@ -12,6 +12,9 @@ from typing import Any
 JOB_PAYLOAD_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
+        # Optional startup-allowlisted project identifier. Clients never send
+        # config paths or commands; omission preserves single-project clients.
+        "project": {"type": "string"},
         # Opaque run label. "cv_v42" means nothing to trainerd; it is only
         # substituted into {version} slots in step command templates.
         "version": {"type": "string"},
@@ -33,6 +36,9 @@ ARTIFACT_MANIFEST_SCHEMA: dict[str, Any] = {
         "run_label": {"type": "string"},
         "job_id": {"type": "string"},
         "produced_at": {"type": "string"},
+        # Optional domain-owned metadata. trainerd stores/transports it without
+        # interpreting sport, market, target, or promotion policy fields.
+        "metadata": {"type": "object"},
         "artifacts": {
             "type": "array",
             "items": {

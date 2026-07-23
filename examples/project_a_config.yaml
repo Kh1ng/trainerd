@@ -1,0 +1,10 @@
+project: project-a
+repo:
+  local_path: .
+work_dir: ./examples/work/project-a
+log_dir: ./examples/logs/project-a
+max_concurrent_jobs: 1
+steps:
+  - id: run_script
+    name: Run Python Script
+    cmd: "python ./examples/hello_job.py --version {version} {extra_args}"

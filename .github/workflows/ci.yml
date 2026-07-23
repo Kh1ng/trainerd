@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m pytest
+      - run: python -m trainerd --version
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install "build>=1.2,<2" "twine>=5,<7"
+      - run: python -m build
+      - run: python -m twine check dist/*
+      - run: python -m venv /tmp/trainerd-wheel-test
+      - run: /tmp/trainerd-wheel-test/bin/python -m pip install dist/*.whl
+      - run: /tmp/trainerd-wheel-test/bin/trainerd --version
+      - run: /tmp/trainerd-wheel-test/bin/python -c "import trainerd; print(trainerd.__file__)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trainerd-distributions
+          path: dist/*
+          if-no-files-found: error
