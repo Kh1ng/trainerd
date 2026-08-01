@@ -266,7 +266,7 @@ def load_lan_task(
     )
     return TrainingConfig(
         project=project,
-        repo=RepoConfig(repo_url, branch, str(repo_root)),
+        repo=RepoConfig(repo_url, branch, str(repo_root), sync_before_job=True),
         work_dir=work_root,
         steps=steps,
         validation=validation,

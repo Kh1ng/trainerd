@@ -97,6 +97,12 @@ LAN mode runs at most one queued, running, or validating job per repository so
 that checkout updates cannot race repository-owned commands. The daemon-wide
 concurrency setting applies across different repositories.
 
+Immediately before a LAN job starts, trainerd verifies that the managed
+checkout has no tracked changes and fast-forwards it to its configured remote
+branch. The exact revision is logged and exported to every step and validation
+command as `TRAINERD_REPO_SHA`. A dirty checkout or non-fast-forward update
+fails the job before repository code runs.
+
 **LAN mode has no authentication. Anyone who can reach the port can run tasks
 from an HTTP Git repository. Keep it behind the host firewall on a trusted LAN.
 Use registry mode for any less-trusted network.**
@@ -126,14 +132,12 @@ Each allowlisted project has its own command configuration:
 project: project-a
 repo:
   local_path: "${PROJECT_A_REPO_PATH}"
+  # Optional outside LAN mode. Safely fast-forward immediately before each job.
+  sync_before_job: true
 work_dir: "${PROJECT_A_WORK_PATH}"
 log_dir: "${PROJECT_A_LOG_PATH}"
 max_concurrent_jobs: 1
 steps:
-  - id: pull
-    name: Update checkout
-    cmd: "git pull --ff-only origin {branch}"
-    timeout_seconds: 300
   - id: run
     name: Run workload
     cmd: ".venv/Scripts/python.exe scripts/run_job.py --version {version}"
@@ -169,7 +173,7 @@ export TRAINERD_API_KEY="$TRAINING_SERVER_API_KEY"
 trainerd submit \
   --server-url http://training-node:7860 \
   --project project-a \
-  --steps pull,run \
+  --steps run \
   --version v42 \
   --wait \
   --logs
@@ -181,7 +185,7 @@ The equivalent request is:
 curl --fail-with-body \
   -H "X-API-Key: $TRAINING_SERVER_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"project":"project-a","steps":["pull","run"],"version":"v42"}' \
+  -d '{"project":"project-a","steps":["run"],"version":"v42"}' \
   http://training-node:7860/api/jobs
 ```
 

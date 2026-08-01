@@ -18,6 +18,7 @@ class RepoConfig:
     url: str
     branch: str
     local_path: str
+    sync_before_job: bool = False
 
 
 @dataclass
@@ -124,6 +125,7 @@ def load_config(path: Path) -> TrainingConfig:
         local_path=_expand_env(
             str(repo_raw.get("local_path", str(Path.home() / "repos" / project)))
         ),
+        sync_before_job=bool(repo_raw.get("sync_before_job", False)),
     )
 
     work_dir = Path(_expand_env(str(raw.get("work_dir", str(Path.home() / "training-work")))))

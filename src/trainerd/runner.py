@@ -23,6 +23,10 @@ from .storage import JobStatus, JobStore
 log = logging.getLogger(__name__)
 
 
+class RepoSyncError(RuntimeError):
+    """The configured checkout could not be safely updated."""
+
+
 class JobRunner:
     def __init__(
         self,
@@ -101,6 +105,15 @@ class JobRunner:
 
             _log(f"=== Job {job_id} starting. version={version} steps={step_ids} ===")
 
+            repo_sha = ""
+            if config.repo.sync_before_job:
+                try:
+                    repo_sha = _sync_repo_checkout(config.repo, branch=branch, log_fn=_log)
+                except RepoSyncError as exc:
+                    self._store.set_failed(job_id, f"Repository sync failed: {exc}")
+                    _log(f"FAILED before steps: {exc}")
+                    return
+
             for step_id in step_ids:
                 config = self._load_current_config()
                 configured_steps = {s.id: s for s in config.steps}
@@ -127,6 +140,8 @@ class JobRunner:
                     for k, v in (step.env or {}).items()
                 } if step.env else None
                 resolved_env = _with_repo_pythonpath(repo_path, resolved_env)
+                if repo_sha:
+                    resolved_env["TRAINERD_REPO_SHA"] = repo_sha
                 resolved_cwd = _resolve_template(step.cwd or "", version=version, repo_path=repo_path, work_dir=work_dir, extra_args=extra_args) or None
                 _log(f"cmd: {cmd}")
                 ok = await _run_cmd(cmd, cwd=resolved_cwd, logfile=logfile, env=resolved_env, timeout=step.timeout_seconds,
@@ -148,7 +163,12 @@ class JobRunner:
 
             config = self._load_current_config()
             if config.validation:
-                ok, result = await _validate(config.validation, version=version, logfile=logfile)
+                ok, result = await _validate(
+                    config.validation,
+                    version=version,
+                    logfile=logfile,
+                    repo_sha=repo_sha,
+                )
                 if ok:
                     self._store.set_validated(job_id, result)
                     _log(f"Validation PASSED: {result}")
@@ -298,6 +318,45 @@ def _with_repo_pythonpath(repo_path: str | None, env: dict[str, str] | None) -> 
     return out
 
 
+def _sync_repo_checkout(repo, *, branch: str, log_fn) -> str:
+    """Fast-forward a clean checkout and return the exact revision to execute."""
+    repo_path = Path(repo.local_path).expanduser().resolve()
+    if not (repo_path / ".git").is_dir():
+        raise RepoSyncError(f"Not a Git checkout: {repo_path}")
+
+    def run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo_path), *args],
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RepoSyncError(str(exc)) from exc
+        if check and result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()[-2000:]
+            raise RepoSyncError(detail or f"git {' '.join(args)} failed")
+        return result
+
+    for args in (("diff", "--quiet"), ("diff", "--cached", "--quiet")):
+        result = run(*args, check=False)
+        if result.returncode == 1:
+            raise RepoSyncError("Checkout has tracked changes; refusing to update")
+        if result.returncode != 0:
+            raise RepoSyncError((result.stderr or result.stdout).strip())
+
+    log_fn(f"Syncing {repo_path} to origin/{branch} with fast-forward only")
+    run("checkout", branch)
+    run("pull", "--ff-only", "origin", branch)
+    revision = run("rev-parse", "HEAD").stdout.strip()
+    if not revision:
+        raise RepoSyncError("Git returned an empty HEAD revision")
+    log_fn(f"Repository revision: {revision}")
+    return revision
+
+
 async def _run_cmd(
     cmd: str,
     cwd: str | None,
@@ -372,13 +431,21 @@ async def _terminate_proc_tree(proc: asyncio.subprocess.Process | None) -> bool:
         return False
 
 
-async def _validate(val_cfg, version: str, logfile) -> tuple[bool, dict]:
+async def _validate(
+    val_cfg,
+    version: str,
+    logfile,
+    *,
+    repo_sha: str = "",
+) -> tuple[bool, dict]:
     cmd = _resolve_cmd(val_cfg.cmd, version=version)
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
         out_path = tmp.name
 
     full_cmd = f"{cmd} --output-json {out_path}" if val_cfg.output_is_json else cmd
     full_env = {**os.environ, **_with_repo_pythonpath(str(getattr(val_cfg, "cwd", "") or ""), getattr(val_cfg, "env", None) or {})}
+    if repo_sha:
+        full_env["TRAINERD_REPO_SHA"] = repo_sha
     try:
         proc = await asyncio.create_subprocess_shell(
             full_cmd,
