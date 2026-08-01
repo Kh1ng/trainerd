@@ -107,6 +107,7 @@ def test_lan_manifest_resolves_managed_paths(tmp_path: Path) -> None:
     config = prepared.config
 
     assert config.repo.local_path == str(prepared.repo_path.resolve())
+    assert config.repo.sync_before_job is True
     assert config.steps[0].cwd == str(prepared.repo_path.resolve())
     assert "{work_dir}" in config.steps[0].cmd
     assert config.validation is not None
