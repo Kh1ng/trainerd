@@ -4,9 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trainerd"
-version = "0.3.1"
+version = "0.3.2"
 description = "Allowlisted HTTP job runner for trusted, queued subprocess workloads"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.10"
 authors = [
   { name = "Kh1ng" },

@@ -214,17 +214,17 @@ Install `trainerd` in a dedicated daemon virtual environment, separate from all
 project virtual environments:
 
 ```powershell
-py -3.12 -m venv C:\ProgramData\trainerd\venvs\0.3.0
-C:\ProgramData\trainerd\venvs\0.3.0\Scripts\python.exe -m pip install --upgrade pip
-C:\ProgramData\trainerd\venvs\0.3.0\Scripts\python.exe -m pip install `
-  https://github.com/Kh1ng/trainerd/releases/download/v0.3.0/trainerd-0.3.0-py3-none-any.whl
-C:\ProgramData\trainerd\venvs\0.3.0\Scripts\trainerd.exe --version
+py -3.12 -m venv C:\ProgramData\trainerd\venvs\0.3.2
+C:\ProgramData\trainerd\venvs\0.3.2\Scripts\python.exe -m pip install --upgrade pip
+C:\ProgramData\trainerd\venvs\0.3.2\Scripts\python.exe -m pip install `
+  https://github.com/Kh1ng/trainerd/releases/download/v0.3.2/trainerd-0.3.2-py3-none-any.whl
+C:\ProgramData\trainerd\venvs\0.3.2\Scripts\trainerd.exe --version
 ```
 
 Run this command from a Windows service wrapper or Scheduled Task:
 
 ```powershell
-C:\ProgramData\trainerd\venvs\0.3.0\Scripts\trainerd.exe serve `
+C:\ProgramData\trainerd\venvs\0.3.2\Scripts\trainerd.exe serve `
   --projects-config C:\ProgramData\trainerd\projects.yaml `
   --host 0.0.0.0 `
   --port 7860
@@ -272,5 +272,4 @@ CLI and import path.
 
 ## License
 
-No license has been granted for redistribution or modification. The repository
-is source-available pending an explicit license decision.
+`trainerd` is released under the [MIT License](LICENSE).
