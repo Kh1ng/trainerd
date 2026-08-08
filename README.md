@@ -260,10 +260,11 @@ $settings = New-ScheduledTaskSettingsSet `
   -DontStopIfGoingOnBatteries `
   -MultipleInstances IgnoreNew
 $boot = New-ScheduledTaskTrigger -AtStartup
+$logon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
   -RepetitionInterval (New-TimeSpan -Minutes 1)
 Set-ScheduledTask -TaskName trainerd-lan -Settings $settings `
-  -Trigger $boot,$watchdog
+  -Trigger $boot,$logon,$watchdog
 ```
 
 Project step commands may invoke each project's own virtual environment. Only
