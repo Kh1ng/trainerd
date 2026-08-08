@@ -189,10 +189,49 @@ def test_cli_lan_mode_has_zero_config_listener_defaults() -> None:
         lan=True,
         state_dir=None,
         max_concurrent_jobs=None,
+        allowed_repos=None,
     )
 
 
-def test_lan_post_repo_and_task_installs_runtime_and_queues_job(tmp_path: Path) -> None:
+def test_cli_lan_mode_passes_repository_allowlist() -> None:
+    with patch("trainerd.server.main") as serve:
+        rc = trainerd_main(
+            [
+                "serve",
+                "--lan",
+                "--allow-repo",
+                "https://git.local/team/repo.git",
+            ]
+        )
+
+    assert rc == 0
+    assert serve.call_args.kwargs["allowed_repos"] == [
+        "https://git.local/team/repo.git"
+    ]
+
+
+def test_lan_allowlist_requires_api_key_and_normalizes(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "TRAINERD_ALLOWED_REPOS",
+        "HTTP://GIT.LOCAL:8080/team/repo.git/",
+    )
+    monkeypatch.delenv("TRAINERD_API_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="TRAINERD_API_KEY is required"):
+        server._validate_lan_security()
+
+    monkeypatch.setenv("TRAINERD_API_KEY", "secret")
+    assert server._validate_lan_security() == {
+        "http://git.local:8080/team/repo.git"
+    }
+
+
+def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TRAINERD_API_KEY", raising=False)
+    monkeypatch.delenv("TRAINERD_ALLOWED_REPOS", raising=False)
     prepared = _prepared(tmp_path)
     old_state = (
         server._server_config,
@@ -266,6 +305,28 @@ def test_lan_post_repo_and_task_installs_runtime_and_queues_job(tmp_path: Path) 
             },
         )
         assert incompatible.status_code == 400
+
+        monkeypatch.setenv("TRAINERD_API_KEY", "secret")
+        monkeypatch.setenv(
+            "TRAINERD_ALLOWED_REPOS",
+            "http://git.local/team/repo.git",
+        )
+        assert client.get("/api/jobs").status_code == 401
+        assert (
+            client.get("/api/jobs", headers={"X-API-Key": "secret"}).status_code
+            == 200
+        )
+        with patch("trainerd.server.prepare_lan_project") as blocked_prepare:
+            blocked = client.post(
+                "/api/jobs",
+                headers={"X-API-Key": "secret"},
+                json={
+                    "repo": "http://git.local/other/repo.git",
+                    "task": "nfl-train",
+                },
+            )
+        assert blocked.status_code == 403
+        blocked_prepare.assert_not_called()
     finally:
         client.close()
         (

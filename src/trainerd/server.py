@@ -74,6 +74,8 @@ _lan_prepare_lock: asyncio.Lock | None = None
 _queue_worker_task: asyncio.Task | None = None
 _running_tasks: dict[str, asyncio.Task] = {}
 _queue_poll_interval: float = 5.0
+_LAN_API_KEY_ENV = "TRAINERD_API_KEY"
+_LAN_ALLOWED_REPOS_ENV = "TRAINERD_ALLOWED_REPOS"
 
 
 class JobRequest(BaseModel):
@@ -103,7 +105,13 @@ def _api_key_auth(
     header_key: str | None = Security(_api_key_header),
     query_key: str | None = Security(_api_key_query),
 ) -> None:
-    api_key = _server_config.api_key if _server_config else (_config.api_key if _config else "")
+    api_key = (
+        os.environ.get(_LAN_API_KEY_ENV, "").strip()
+        if _is_lan_mode()
+        else _server_config.api_key
+        if _server_config
+        else (_config.api_key if _config else "")
+    )
     if not api_key:
         return
     key = header_key or query_key
@@ -142,6 +150,27 @@ def _is_registry_mode() -> bool:
 
 def _is_lan_mode() -> bool:
     return _lan_mode_active
+
+
+def _lan_allowed_repo_urls() -> frozenset[str]:
+    values = [
+        value.strip()
+        for value in os.environ.get(_LAN_ALLOWED_REPOS_ENV, "").splitlines()
+        if value.strip()
+    ]
+    try:
+        return frozenset(normalize_repo_url(value) for value in values)
+    except LanConfigError as exc:
+        raise ValueError(f"{_LAN_ALLOWED_REPOS_ENV} is invalid: {exc}") from exc
+
+
+def _validate_lan_security() -> frozenset[str]:
+    allowed_repos = _lan_allowed_repo_urls()
+    if allowed_repos and not os.environ.get(_LAN_API_KEY_ENV, "").strip():
+        raise ValueError(
+            f"{_LAN_API_KEY_ENV} is required when LAN repositories are allowlisted"
+        )
+    return allowed_repos
 
 
 def _select_runtime(project: Any = None) -> ProjectRuntime:
@@ -352,6 +381,7 @@ async def _lifespan(app: FastAPI):
     global _lan_mode_active, _lan_state_dir, _lan_max_concurrent_jobs, _lan_prepare_lock
     _lan_mode_active = os.environ.get("TRAINERD_LAN_MODE") == "1"
     _projects = {}
+    allowed_repos: frozenset[str] = frozenset()
     if _lan_mode_active:
         _server_config = None
         _default_project = None
@@ -374,6 +404,7 @@ async def _lifespan(app: FastAPI):
             raise ValueError("TRAINERD_MAX_CONCURRENT_JOBS must be an integer") from exc
         if not 1 <= _lan_max_concurrent_jobs <= 64:
             raise ValueError("TRAINERD_MAX_CONCURRENT_JOBS must be from 1 to 64")
+        allowed_repos = _validate_lan_security()
         _lan_prepare_lock = asyncio.Lock()
     else:
         _server_config = load_server_config()
@@ -402,10 +433,17 @@ async def _lifespan(app: FastAPI):
     # Start background queue worker
     _queue_worker_task = asyncio.create_task(_queue_worker())
 
-    if _lan_mode_active:
+    if _lan_mode_active and not allowed_repos:
         log.warning(
-            "INSECURE LAN MODE enabled on managed state %s; authentication is disabled",
+            "LAN mode accepts arbitrary repositories on managed state %s; "
+            "configure --allow-repo for a repository boundary",
             _lan_state_dir,
+        )
+    elif _lan_mode_active:
+        log.info(
+            "Constrained LAN mode enabled on %s with %s allowlisted repository(s)",
+            _lan_state_dir,
+            len(allowed_repos),
         )
     else:
         log.info(
@@ -474,6 +512,16 @@ async def health() -> dict:
         "running_jobs": running,
         "max_concurrent_jobs": max_jobs,
         "queue_capacity": max(max_jobs - active, 0),
+        "authentication_required": bool(
+            os.environ.get(_LAN_API_KEY_ENV, "").strip()
+            if _is_lan_mode()
+            else _server_config.api_key
+            if _server_config
+            else (_config.api_key if _config else "")
+        ),
+        "allowed_repository_count": (
+            len(_lan_allowed_repo_urls()) if _is_lan_mode() else None
+        ),
     }
 
 
@@ -588,6 +636,12 @@ async def _prepare_lan_runtime(
     async with lock:
         try:
             normalized_repo = normalize_repo_url(selected_repo)
+            allowed_repos = _lan_allowed_repo_urls()
+            if allowed_repos and normalized_repo not in allowed_repos:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Repository is not allowlisted on this trainerd host",
+                )
             selected_key = repo_key(normalized_repo)
             for existing_runtime in _projects.values():
                 if existing_runtime.lan_repo_key != selected_key:
@@ -831,9 +885,18 @@ def main(
     lan: bool = False,
     state_dir: str | None = None,
     max_concurrent_jobs: int | None = None,
+    allowed_repos: list[str] | None = None,
 ) -> None:
-    if not lan and (state_dir is not None or max_concurrent_jobs is not None):
-        raise ValueError("--state-dir and --max-concurrent-jobs require --lan")
+    if not lan and (
+        state_dir is not None
+        or max_concurrent_jobs is not None
+        or allowed_repos is not None
+    ):
+        raise ValueError(
+            "--state-dir, --max-concurrent-jobs, and --allow-repo require --lan"
+        )
+    if not lan:
+        os.environ.pop(_LAN_ALLOWED_REPOS_ENV, None)
     if lan:
         os.environ["TRAINERD_LAN_MODE"] = "1"
         os.environ.pop("TRAINERD_PROJECTS_CONFIG", None)
@@ -848,6 +911,11 @@ def main(
             os.environ["TRAINERD_MAX_CONCURRENT_JOBS"] = str(max_concurrent_jobs)
         else:
             os.environ.pop("TRAINERD_MAX_CONCURRENT_JOBS", None)
+        if allowed_repos:
+            os.environ[_LAN_ALLOWED_REPOS_ENV] = "\n".join(
+                normalize_repo_url(value) for value in allowed_repos
+            )
+        _validate_lan_security()
         server_port = 7860
     elif projects_config:
         os.environ.pop("TRAINERD_LAN_MODE", None)
