@@ -36,6 +36,20 @@ path, or SSH configuration:
 trainerd serve --lan
 ```
 
+For a persistent network listener, constrain LAN mode to reviewed repositories
+and require the existing API-key header. Keep the secret in the environment,
+not the command line:
+
+```powershell
+$env:TRAINERD_API_KEY = "replace-with-a-long-random-secret"
+trainerd serve --lan `
+  --allow-repo http://git.local/Khing/sportsball-bets.git
+```
+
+`--allow-repo` is repeatable and fails startup unless `TRAINERD_API_KEY` is
+set. Requests to job, log, model, cancellation, and promotion endpoints then
+require `X-API-Key`; `/api/health` remains available for monitoring.
+
 It listens on `0.0.0.0:7860`. On Windows, managed checkouts and job state
 default to `%PROGRAMDATA%\trainerd\state`; `--state-dir` can override this.
 
@@ -51,6 +65,7 @@ $body = @{
 Invoke-RestMethod `
   -Method Post `
   -Uri http://127.0.0.1:7860/api/jobs `
+  -Headers @{ "X-API-Key" = $env:TRAINERD_API_KEY } `
   -ContentType application/json `
   -Body $body
 ```
@@ -214,17 +229,17 @@ Install `trainerd` in a dedicated daemon virtual environment, separate from all
 project virtual environments:
 
 ```powershell
-py -3.12 -m venv C:\ProgramData\trainerd\venvs\0.3.2
-C:\ProgramData\trainerd\venvs\0.3.2\Scripts\python.exe -m pip install --upgrade pip
-C:\ProgramData\trainerd\venvs\0.3.2\Scripts\python.exe -m pip install `
-  https://github.com/Kh1ng/trainerd/releases/download/v0.3.2/trainerd-0.3.2-py3-none-any.whl
-C:\ProgramData\trainerd\venvs\0.3.2\Scripts\trainerd.exe --version
+py -3.12 -m venv C:\ProgramData\trainerd\venvs\0.3.3
+C:\ProgramData\trainerd\venvs\0.3.3\Scripts\python.exe -m pip install --upgrade pip
+C:\ProgramData\trainerd\venvs\0.3.3\Scripts\python.exe -m pip install `
+  https://github.com/Kh1ng/trainerd/releases/download/v0.3.3/trainerd-0.3.3-py3-none-any.whl
+C:\ProgramData\trainerd\venvs\0.3.3\Scripts\trainerd.exe --version
 ```
 
 Run this command from a Windows service wrapper or Scheduled Task:
 
 ```powershell
-C:\ProgramData\trainerd\venvs\0.3.2\Scripts\trainerd.exe serve `
+C:\ProgramData\trainerd\venvs\0.3.3\Scripts\trainerd.exe serve `
   --projects-config C:\ProgramData\trainerd\projects.yaml `
   --host 0.0.0.0 `
   --port 7860

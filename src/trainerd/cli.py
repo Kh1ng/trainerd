@@ -77,6 +77,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         lan=args.lan,
         state_dir=args.state_dir,
         max_concurrent_jobs=args.max_concurrent_jobs,
+        allowed_repos=args.allow_repo,
     )
     return 0
 
@@ -223,6 +224,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-concurrent-jobs",
         type=int,
         help="Daemon-wide LAN concurrency (only valid with --lan; default: 1).",
+    )
+    serve.add_argument(
+        "--allow-repo",
+        action="append",
+        help=(
+            "Anonymous HTTP(S) Git repository allowed in LAN mode; repeat for "
+            "additional repositories. Requires TRAINERD_API_KEY."
+        ),
     )
     serve.set_defaults(func=_cmd_serve)
 
