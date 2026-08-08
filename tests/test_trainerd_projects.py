@@ -424,6 +424,37 @@ def test_cli_submit_sends_project_without_paths_or_commands() -> None:
     assert "cmd" not in payload
 
 
+def test_cli_submit_sends_lan_repo_and_task() -> None:
+    result = {
+        "job_id": "job-456",
+        "project": "lan-project",
+        "status": "pending",
+        "version": "v36",
+        "steps": ["evaluate"],
+    }
+    with patch("trainerd.cli._request_json", return_value=result) as request:
+        rc = trainerd_main(
+            [
+                "submit",
+                "--server-url",
+                "http://trainerd.local",
+                "--repo",
+                "http://git.local/team/repo.git",
+                "--task",
+                "nfl-research",
+                "--version",
+                "v36",
+            ]
+        )
+
+    assert rc == 0
+    payload = request.call_args.args[3]
+    assert payload["repo"] == "http://git.local/team/repo.git"
+    assert payload["task"] == "nfl-research"
+    assert "config_path" not in payload
+    assert "cmd" not in payload
+
+
 def test_openapi_job_request_forbids_additional_properties() -> None:
     openapi = server.app.openapi()
     schema = openapi["components"]["schemas"]["JobRequest"]

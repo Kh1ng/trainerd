@@ -73,6 +73,13 @@ Invoke-RestMethod `
 The daemon clones or fast-forwards its own managed checkout and loads
 `.trainerd.yaml` from the repository root:
 
+```powershell
+trainerd submit `
+  --server-url http://127.0.0.1:7860 `
+  --repo http://git.local/Khing/sportsball-bets.git `
+  --task nfl-train
+```
+
 ```yaml
 version: 1
 tasks:
@@ -229,17 +236,17 @@ Install `trainerd` in a dedicated daemon virtual environment, separate from all
 project virtual environments:
 
 ```powershell
-py -3.12 -m venv C:\ProgramData\trainerd\venvs\0.3.3
-C:\ProgramData\trainerd\venvs\0.3.3\Scripts\python.exe -m pip install --upgrade pip
-C:\ProgramData\trainerd\venvs\0.3.3\Scripts\python.exe -m pip install `
-  https://github.com/Kh1ng/trainerd/releases/download/v0.3.3/trainerd-0.3.3-py3-none-any.whl
-C:\ProgramData\trainerd\venvs\0.3.3\Scripts\trainerd.exe --version
+py -3.12 -m venv C:\ProgramData\trainerd\venvs\0.3.4
+C:\ProgramData\trainerd\venvs\0.3.4\Scripts\python.exe -m pip install --upgrade pip
+C:\ProgramData\trainerd\venvs\0.3.4\Scripts\python.exe -m pip install `
+  https://github.com/Kh1ng/trainerd/releases/download/v0.3.4/trainerd-0.3.4-py3-none-any.whl
+C:\ProgramData\trainerd\venvs\0.3.4\Scripts\trainerd.exe --version
 ```
 
 Run this command from a Windows service wrapper or Scheduled Task:
 
 ```powershell
-C:\ProgramData\trainerd\venvs\0.3.3\Scripts\trainerd.exe serve `
+C:\ProgramData\trainerd\venvs\0.3.4\Scripts\trainerd.exe serve `
   --projects-config C:\ProgramData\trainerd\projects.yaml `
   --host 0.0.0.0 `
   --port 7860

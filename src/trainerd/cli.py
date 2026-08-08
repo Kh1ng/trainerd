@@ -138,6 +138,10 @@ def _cmd_submit(args: argparse.Namespace) -> int:
     payload: dict[str, Any] = {"triggered_by": args.triggered_by}
     if args.project:
         payload["project"] = args.project
+    if args.repo:
+        payload["repo"] = args.repo
+    if args.task:
+        payload["task"] = args.task
     if args.version and str(args.version).strip().lower() != "auto":
         payload["version"] = args.version
     if args.steps:
@@ -266,6 +270,14 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument(
         "--project",
         help="Startup-allowlisted project id (required in registry mode).",
+    )
+    submit.add_argument(
+        "--repo",
+        help="Allowlisted HTTP(S) Git repository URL (required in LAN mode).",
+    )
+    submit.add_argument(
+        "--task",
+        help="Repository-owned task name (required in LAN mode).",
     )
     submit.add_argument("--version", help="Optional. Omit or pass 'auto' to use the server's next vN.")
     submit.add_argument("--steps", help="Comma-separated subset of step ids to run")
