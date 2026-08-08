@@ -230,6 +230,27 @@ C:\ProgramData\trainerd\venvs\0.3.2\Scripts\trainerd.exe serve `
   --port 7860
 ```
 
+Scheduled Tasks must run indefinitely and recover if the daemon exits. After
+registering a task named `trainerd-lan`, apply these native Task Scheduler
+settings. The repeating trigger is ignored while the daemon is already
+running and starts it within one minute if it is not:
+
+```powershell
+$settings = New-ScheduledTaskSettingsSet `
+  -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
+  -RestartCount 999 `
+  -RestartInterval (New-TimeSpan -Minutes 1) `
+  -StartWhenAvailable `
+  -AllowStartIfOnBatteries `
+  -DontStopIfGoingOnBatteries `
+  -MultipleInstances IgnoreNew
+$boot = New-ScheduledTaskTrigger -AtStartup
+$watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+  -RepetitionInterval (New-TimeSpan -Minutes 1)
+Set-ScheduledTask -TaskName trainerd-lan -Settings $settings `
+  -Trigger $boot,$watchdog
+```
+
 Project step commands may invoke each project's own virtual environment. Only
 the daemon itself belongs in the dedicated `trainerd` environment. A normal
 upgrade installs a new versioned daemon environment, validates it on an
