@@ -273,6 +273,7 @@ def test_server_routes_jobs_only_to_explicit_allowlisted_project(
         assert runtimes["alpha"].store.get_job(alpha_submit.json()["job_id"])
         assert runtimes["beta"].store.get_job(beta_submit.json()["job_id"])
 
+        assert client.get("/api/jobs").status_code == 401
         listed = client.get("/api/jobs", headers=headers)
         assert {job["project"] for job in listed.json()} == {"alpha", "beta"}
 

@@ -119,6 +119,14 @@ def _api_key_auth(
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
+def _read_api_key_auth(
+    header_key: str | None = Security(_api_key_header),
+    query_key: str | None = Security(_api_key_query),
+) -> None:
+    if not _is_lan_mode():
+        _api_key_auth(header_key, query_key)
+
+
 def _runtime_map() -> dict[str, ProjectRuntime]:
     if _projects:
         return _projects
@@ -720,7 +728,7 @@ def _lan_runtime_busy(runtime: ProjectRuntime) -> bool:
     return bool(pending or active)
 
 
-@app.get("/api/jobs", dependencies=[Depends(_api_key_auth)])
+@app.get("/api/jobs", dependencies=[Depends(_read_api_key_auth)])
 async def list_jobs(limit: int = 20) -> list[dict]:
     jobs = [
         _with_project(runtime, job)
@@ -730,7 +738,7 @@ async def list_jobs(limit: int = 20) -> list[dict]:
     return sorted(jobs, key=lambda job: job.get("created_at") or "", reverse=True)[:limit]
 
 
-@app.get("/api/jobs/{job_id}", dependencies=[Depends(_api_key_auth)])
+@app.get("/api/jobs/{job_id}", dependencies=[Depends(_read_api_key_auth)])
 async def get_job(job_id: str) -> dict:
     found = _find_job_runtime(job_id)
     if not found:
@@ -739,7 +747,7 @@ async def get_job(job_id: str) -> dict:
     return _with_project(runtime, job)
 
 
-@app.get("/api/jobs/{job_id}/logs", dependencies=[Depends(_api_key_auth)])
+@app.get("/api/jobs/{job_id}/logs", dependencies=[Depends(_read_api_key_auth)])
 async def stream_logs(job_id: str, request: Request, tail: int | None = None) -> Response:
     """Stream job logs as plain text. Accepts ?tail=N to return last N lines."""
     found = _find_job_runtime(job_id)
@@ -833,7 +841,7 @@ async def promote_job(job_id: str) -> dict:
     return {"job_id": job_id, "project": runtime.project, "status": "promoting"}
 
 
-@app.get("/api/models", dependencies=[Depends(_api_key_auth)])
+@app.get("/api/models", dependencies=[Depends(_read_api_key_auth)])
 async def list_models(project: str | None = None) -> list[dict]:
     """List promoted model versions in the git repo."""
     runtime = _select_runtime(project)
