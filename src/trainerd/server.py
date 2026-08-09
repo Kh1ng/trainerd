@@ -265,6 +265,40 @@ def _find_job_runtime(job_id: str) -> tuple[ProjectRuntime, dict] | None:
     return found[0] if found else None
 
 
+def _persisted_lan_stores() -> list[tuple[str, JobStore, Path]]:
+    if not _is_lan_mode() or _lan_state_dir is None:
+        return []
+    loaded_logs = {
+        runtime.config.log_dir.resolve() for runtime in _runtime_map().values()
+    }
+    root = _lan_state_dir / "jobs"
+    if not root.is_dir():
+        return []
+    return [
+        (path.name, JobStore(path / "jobs.db"), path)
+        for path in root.iterdir()
+        if path.is_dir()
+        and (path / "jobs.db").is_file()
+        and path.resolve() not in loaded_logs
+    ]
+
+
+def _find_persisted_lan_job(
+    job_id: str,
+) -> tuple[str, JobStore, Path, dict] | None:
+    found = [
+        (project, store, log_dir, job)
+        for project, store, log_dir in _persisted_lan_stores()
+        if (job := store.get_job(job_id)) is not None
+    ]
+    if len(found) > 1:
+        projects = ", ".join(item[0] for item in found)
+        raise RuntimeError(
+            f"Ambiguous persisted job id {job_id!r} exists in projects: {projects}"
+        )
+    return found[0] if found else None
+
+
 def _validate_unique_job_ids(runtimes: dict[str, ProjectRuntime]) -> None:
     owners: dict[str, str] = {}
     for runtime in runtimes.values():
@@ -735,26 +769,40 @@ async def list_jobs(limit: int = 20) -> list[dict]:
         for runtime in _runtime_map().values()
         for job in runtime.store.list_jobs(limit=limit)
     ]
+    jobs.extend(
+        {**job, "project": project}
+        for project, store, _ in _persisted_lan_stores()
+        for job in store.list_jobs(limit=limit)
+    )
     return sorted(jobs, key=lambda job: job.get("created_at") or "", reverse=True)[:limit]
 
 
 @app.get("/api/jobs/{job_id}", dependencies=[Depends(_read_api_key_auth)])
 async def get_job(job_id: str) -> dict:
     found = _find_job_runtime(job_id)
-    if not found:
-        raise HTTPException(status_code=404, detail="Job not found")
-    runtime, job = found
-    return _with_project(runtime, job)
+    if found:
+        runtime, job = found
+        return _with_project(runtime, job)
+    persisted = _find_persisted_lan_job(job_id)
+    if persisted:
+        project, _, _, job = persisted
+        return {**job, "project": project}
+    raise HTTPException(status_code=404, detail="Job not found")
 
 
 @app.get("/api/jobs/{job_id}/logs", dependencies=[Depends(_read_api_key_auth)])
 async def stream_logs(job_id: str, request: Request, tail: int | None = None) -> Response:
     """Stream job logs as plain text. Accepts ?tail=N to return last N lines."""
     found = _find_job_runtime(job_id)
-    if not found:
+    if found:
+        runtime, _ = found
+        store = runtime.store
+        log_dir = runtime.config.log_dir
+    elif persisted := _find_persisted_lan_job(job_id):
+        _, store, log_dir, _ = persisted
+    else:
         return PlainTextResponse("Log not available yet.\n", status_code=404)
-    runtime, _ = found
-    log_path = runtime.config.log_dir / f"{job_id}.log"
+    log_path = log_dir / f"{job_id}.log"
     if not log_path.exists():
         return PlainTextResponse("Log not available yet.\n")
 
@@ -772,7 +820,7 @@ async def stream_logs(job_id: str, request: Request, tail: int | None = None) ->
                 if chunk:
                     yield chunk
                 else:
-                    if runtime.store.get_job(job_id, field="status") in (
+                    if store.get_job(job_id, field="status") in (
                         JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.PROMOTED
                     ):
                         break
