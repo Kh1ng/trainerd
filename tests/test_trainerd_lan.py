@@ -17,6 +17,7 @@ from trainerd.lan import (
     normalize_repo_url,
     repo_key,
 )
+from trainerd.storage import JobStore
 
 
 def _write_manifest(repo: Path, *, cwd: str = ".") -> Path:
@@ -349,4 +350,54 @@ def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
             server._lan_state_dir,
             server._lan_prepare_lock,
             server._running_tasks,
+        ) = old_state
+
+
+def test_lan_reads_persisted_jobs_after_restart(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    project = "lan-persisted-nfl-research"
+    log_dir = state_dir / "jobs" / project
+    store = JobStore(log_dir / "jobs.db")
+    job = store.create_job(
+        "e49c6bca",
+        steps=["evaluate"],
+        version="v38",
+    )
+    store.set_completed(job["job_id"])
+    (log_dir / "e49c6bca.log").write_text("completed\n", encoding="utf-8")
+    old_state = (
+        server._lan_mode_active,
+        server._lan_state_dir,
+        server._projects,
+        server._default_project,
+        server._store,
+        server._runner,
+        server._config,
+        server._config_path,
+    )
+    server._lan_mode_active = True
+    server._lan_state_dir = state_dir
+    server._projects = {}
+    server._default_project = None
+    server._store = None
+    server._runner = None
+    server._config = None
+    server._config_path = None
+
+    client = TestClient(server.app)
+    try:
+        assert client.get("/api/jobs").json()[0]["job_id"] == "e49c6bca"
+        assert client.get("/api/jobs/e49c6bca").json()["status"] == "completed"
+        assert client.get("/api/jobs/e49c6bca/logs").text == "completed\n"
+    finally:
+        client.close()
+        (
+            server._lan_mode_active,
+            server._lan_state_dir,
+            server._projects,
+            server._default_project,
+            server._store,
+            server._runner,
+            server._config,
+            server._config_path,
         ) = old_state

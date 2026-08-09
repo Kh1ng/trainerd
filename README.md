@@ -48,7 +48,8 @@ trainerd serve --lan `
 
 `--allow-repo` is repeatable and fails startup unless `TRAINERD_API_KEY` is
 set. Submitting, cancelling, and promoting jobs require `X-API-Key`. Health,
-job status, logs, and model metadata remain readable on the trusted LAN.
+job status, logs, and model metadata remain readable on the trusted LAN, and
+persisted job status and logs remain readable after daemon restarts.
 
 It listens on `0.0.0.0:7860`. On Windows, managed checkouts and job state
 default to `%PROGRAMDATA%\trainerd\state`; `--state-dir` can override this.
