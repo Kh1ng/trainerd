@@ -311,11 +311,19 @@ def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
             "TRAINERD_ALLOWED_REPOS",
             "http://git.local/team/repo.git",
         )
-        assert client.get("/api/jobs").status_code == 401
-        assert (
-            client.get("/api/jobs", headers={"X-API-Key": "secret"}).status_code
-            == 200
-        )
+        assert client.get("/api/jobs").status_code == 200
+        assert client.get(f"/api/jobs/{result['job_id']}").status_code == 200
+        assert client.get(
+            f"/api/jobs/{result['job_id']}/logs"
+        ).status_code == 200
+        assert client.get("/api/models").status_code == 200
+        assert client.post(
+            "/api/jobs",
+            json={
+                "repo": "http://git.local/team/repo.git",
+                "task": "nfl-train",
+            },
+        ).status_code == 401
         with patch("trainerd.server.prepare_lan_project") as blocked_prepare:
             blocked = client.post(
                 "/api/jobs",
