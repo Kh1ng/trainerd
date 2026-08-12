@@ -31,7 +31,6 @@ _MAX_REPO_URL = 2048
 _MAX_COMMAND = 16_384
 _MAX_STRING = 1024
 _MAX_STEPS = 64
-_MAX_TASKS = 64
 _GIT_TIMEOUT_SECONDS = 300
 
 
@@ -203,8 +202,6 @@ def load_lan_task(
     tasks = raw.get("tasks")
     if not isinstance(tasks, dict) or not tasks:
         raise LanConfigError(".trainerd.yaml requires a non-empty tasks mapping")
-    if len(tasks) > _MAX_TASKS:
-        raise LanConfigError(f".trainerd.yaml supports at most {_MAX_TASKS} tasks")
     for task_id in tasks:
         _safe_id(task_id, "task id")
     if task not in tasks:

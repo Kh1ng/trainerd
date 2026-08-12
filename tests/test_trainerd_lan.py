@@ -177,6 +177,35 @@ def test_lan_manifest_rejects_non_utf8_as_client_error(tmp_path: Path) -> None:
         )
 
 
+def test_lan_manifest_does_not_cap_named_tasks(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    manifest = _write_manifest(repo)
+    raw = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+    template = raw["tasks"]["nfl-train"]
+    raw["tasks"] = {
+        f"task-{index}": template for index in range(100)
+    }
+    manifest.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    work = tmp_path / "state" / "work"
+    logs = tmp_path / "state" / "logs"
+    work.mkdir(parents=True)
+    logs.mkdir(parents=True)
+
+    config = load_lan_task(
+        manifest,
+        task="task-99",
+        project="lan-test",
+        repo_url="http://git.local/team/repo.git",
+        repo_path=repo,
+        branch="main",
+        work_dir=work,
+        log_dir=logs,
+    )
+
+    assert config.steps[0].id == "train"
+
+
 def test_cli_lan_mode_has_zero_config_listener_defaults() -> None:
     with patch("trainerd.server.main") as serve:
         rc = trainerd_main(["serve", "--lan"])
