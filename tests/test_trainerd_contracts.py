@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 import trainerd.server as server_mod
 from trainerd.contracts import ARTIFACT_MANIFEST_SCHEMA, validate_payload
-from trainerd.runner import JobRunner
+from trainerd.runner import JobRunner, StageQueuePool
 from trainerd.storage import JobStore
 
 
@@ -138,13 +138,15 @@ def test_trainerd_submit_status_logs_and_cancel_contract(tmp_path: Path) -> None
 
 def test_trainerd_submit_persists_stage_queue_handoff(tmp_path: Path) -> None:
     client, old_state = _configure_trainerd_server(tmp_path)
+    old_stage_queues = server_mod._stage_queues
     try:
+        server_mod._stage_queues = StageQueuePool(gpu=2)
         config_path = server_mod._config_path
         assert config_path is not None
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         raw["steps"] = [
             {"id": "prepare", "cmd": "prepare", "queue": "cpu"},
-            {"id": "train", "cmd": "train", "queue": "gpu"},
+            {"id": "train", "cmd": "train", "queue": "gpu", "units": 2},
         ]
         config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
         server_mod._config = server_mod.load_config(config_path)
@@ -158,8 +160,46 @@ def test_trainerd_submit_persists_stage_queue_handoff(tmp_path: Path) -> None:
 
         assert job["stages"]["prepare"]["queue"] == "cpu"
         assert job["stages"]["prepare"]["queued_at"]
-        assert job["stages"]["train"] == {"queue": "gpu", "status": "pending"}
+        assert job["stages"]["train"] == {
+            "queue": "gpu",
+            "units": 2,
+            "status": "pending",
+        }
+        assert job["stage_queues"]["gpu"] == {
+            "running": 0,
+            "total": 2,
+            "limit": 2,
+            "claimed": 0,
+            "available": 2,
+            "occupancy": 0,
+        }
+        assert client.get("/api/health").json()["stage_queues"]["gpu"]["total"] == 2
     finally:
+        server_mod._stage_queues = old_stage_queues
+        client.close()
+        _restore_trainerd_server(old_state)
+
+
+def test_trainerd_rejects_stage_request_over_gpu_capacity(tmp_path: Path) -> None:
+    client, old_state = _configure_trainerd_server(tmp_path)
+    old_stage_queues = server_mod._stage_queues
+    try:
+        server_mod._stage_queues = StageQueuePool(gpu=1)
+        config_path = server_mod._config_path
+        assert config_path is not None
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        raw["steps"] = [
+            {"id": "train", "cmd": "train", "queue": "gpu", "units": 2},
+        ]
+        config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+        submitted = client.post("/api/jobs", json={"version": "v10"})
+
+        assert submitted.status_code == 400
+        assert submitted.json()["detail"] == "GPU stage requests 2 units but capacity is 1"
+        assert server_mod._store.list_jobs() == []
+    finally:
+        server_mod._stage_queues = old_stage_queues
         client.close()
         _restore_trainerd_server(old_state)
 

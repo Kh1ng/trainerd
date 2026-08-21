@@ -38,31 +38,52 @@ class StageQueuePool:
     def __init__(self, *, cpu: int = 1, gpu: int = 1) -> None:
         if not 1 <= cpu <= 64:
             raise ValueError("CPU stage queue limit must be from 1 to 64")
-        if gpu != 1:
-            raise ValueError("The GPU stage queue limit must be 1 for the configured GPU")
-        self._limits = {"cpu": cpu, "gpu": gpu}
-        self._semaphores = {name: asyncio.Semaphore(limit) for name, limit in self._limits.items()}
+        if not 1 <= gpu <= 64:
+            raise ValueError("GPU stage queue capacity must be from 1 to 64")
+        self._totals = {"cpu": cpu, "gpu": gpu}
+        self._claimed = {"cpu": 0, "gpu": 0}
         self._running = {"cpu": 0, "gpu": 0}
+        self._changed = asyncio.Condition()
+
+    def validate(self, queue: str, units: int = 1) -> None:
+        if queue not in self._totals:
+            raise ValueError(f"Unsupported stage queue: {queue}")
+        if isinstance(units, bool) or not isinstance(units, int) or units < 1:
+            raise ValueError("Stage queue units must be a positive integer")
+        if units > self._totals[queue]:
+            raise ValueError(
+                f"{queue.upper()} stage requests {units} units but capacity is "
+                f"{self._totals[queue]}"
+            )
 
     @asynccontextmanager
-    async def claim(self, queue: str):
-        semaphore = self._semaphores[queue]
-        await semaphore.acquire()
-        self._running[queue] += 1
+    async def claim(self, queue: str, units: int = 1):
+        self.validate(queue, units)
+        async with self._changed:
+            await self._changed.wait_for(
+                lambda: self._claimed[queue] + units <= self._totals[queue]
+            )
+            self._claimed[queue] += units
+            self._running[queue] += 1
         try:
             yield
         finally:
-            self._running[queue] -= 1
-            semaphore.release()
+            async with self._changed:
+                self._claimed[queue] -= units
+                self._running[queue] -= 1
+                self._changed.notify_all()
 
     def snapshot(self) -> dict[str, dict[str, int | float]]:
         return {
-            name: {
-                "running": self._running[name],
-                "limit": limit,
-                "occupancy": self._running[name] / limit,
+            queue: {
+                "running": self._running[queue],
+                "total": total,
+                "limit": total,
+                "claimed": self._claimed[queue],
+                "available": total - self._claimed[queue],
+                "occupancy": self._claimed[queue] / total,
             }
-            for name, limit in self._limits.items()
+            for queue, total in self._totals.items()
         }
 
 
@@ -275,7 +296,7 @@ class JobRunner:
                         _log(f"--- Step already completed before restart: {step.name} ---")
                         continue
                     try:
-                        async with self._queues.claim(queue):
+                        async with self._queues.claim(queue, prior.get("units", 1)):
                             self._store.set_running(job_id, step.id)
                             self._store.set_stage_running(job_id, step.id)
                             started = time.perf_counter()

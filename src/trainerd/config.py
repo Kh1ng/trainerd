@@ -30,6 +30,7 @@ class StepConfig:
     env: dict[str, str] = field(default_factory=dict)
     timeout_seconds: int = 7200  # 2 hours default
     queue: str | None = None
+    units: int = 1
 
 
 @dataclass
@@ -146,6 +147,7 @@ def load_config(path: Path) -> TrainingConfig:
             env={k: _resolve(v, work_dir, repo.local_path) for k, v in s.get("env", {}).items()},
             timeout_seconds=s.get("timeout_seconds", 7200),
             queue=s.get("queue"),
+            units=s.get("units", 1),
         )
         for s in raw.get("steps", [])
     ]
@@ -199,6 +201,15 @@ def _validate_step_queues(steps: list[StepConfig]) -> None:
     invalid = sorted({queue for queue in queues if queue not in (None, "cpu", "gpu")})
     if invalid:
         raise ValueError(f"Unsupported step queue(s): {', '.join(invalid)}")
+    if any(
+        isinstance(step.units, bool)
+        or not isinstance(step.units, int)
+        or not 1 <= step.units <= 64
+        for step in steps
+    ):
+        raise ValueError("Step queue units must be integers from 1 to 64")
+    if any(step.queue is None and step.units != 1 for step in steps):
+        raise ValueError("Step queue units require a queue")
 
 
 def _manifest_path(value: Any, manifest_path: Path) -> Path:

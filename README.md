@@ -103,6 +103,8 @@ tasks:
       - id: train
         name: Train NFL models
         queue: gpu
+        # This stage claims both units from a daemon started with --gpu-capacity 2.
+        units: 2
         cmd: 'py -3.12 -u scripts/trainerd_nfl_task.py --work-dir "{work_dir}"'
         cwd: "."
         timeout_seconds: 14400
@@ -133,11 +135,17 @@ Set a task's `max_concurrent_jobs` above one to allow jobs from that repository
 to overlap. The daemon-wide limit still caps total active jobs.
 
 When every task step sets `queue: cpu` or `queue: gpu`, trainerd persists each
-stage handoff and admits it through a daemon-wide queue. The GPU queue is fixed
-at one stage for the configured GPU. Set CPU capacity with
-`--cpu-concurrency`; set `--max-concurrent-jobs 1` to disable overlap. Job
-status includes stage wait/duration metrics, and `/api/health` reports live
-queue occupancy. Stages in one job share `TRAINERD_ARTIFACT_DIR`.
+stage handoff and admits it through a daemon-wide queue. Each stage claims one
+`unit` by default. Set CPU capacity with `--cpu-concurrency` and GPU capacity
+with `--gpu-capacity`; both default to one. A stage can set `units` up to its
+queue's configured capacity. Job status and `/api/health` report total,
+claimed, and available capacity. Stages in one job share
+`TRAINERD_ARTIFACT_DIR`.
+
+GPU units are operator-defined slots, not measured VRAM. Leave VRAM headroom,
+measure each workload, and raise `--gpu-capacity` gradually. A request that
+fits the configured units can still exhaust device memory if the estimates are
+wrong. Set `--max-concurrent-jobs 1` to disable job overlap.
 
 At submission, trainerd verifies that the managed checkout has no tracked
 changes, fast-forwards it, and saves the exact revision. Each job runs in a

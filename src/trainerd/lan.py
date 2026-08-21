@@ -304,7 +304,7 @@ def load_lan_task(
             raise LanConfigError(f"{label} must be a mapping")
         _only_keys(
             value,
-            {"id", "name", "cmd", "cwd", "env", "timeout_seconds", "queue"},
+            {"id", "name", "cmd", "cwd", "env", "timeout_seconds", "queue", "units"},
             label,
         )
         step_id = _safe_id(value.get("id"), f"{label} id")
@@ -319,7 +319,10 @@ def load_lan_task(
         queue = value.get("queue")
         if queue not in (None, "cpu", "gpu"):
             raise LanConfigError(f"{label} queue must be cpu or gpu")
-        steps.append(StepConfig(step_id, name, cmd, cwd, env, timeout, queue))
+        units = _bounded_int(value.get("units", 1), 1, 64, f"{label} units")
+        if queue is None and "units" in value:
+            raise LanConfigError(f"{label} units require a queue")
+        steps.append(StepConfig(step_id, name, cmd, cwd, env, timeout, queue, units))
 
     if any(step.queue for step in steps) and not all(step.queue for step in steps):
         raise LanConfigError(f"task {task!r} must assign every step to a queue")
