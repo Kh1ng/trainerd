@@ -49,7 +49,12 @@ class JobStore:
                     extra_args TEXT
                 )
             """)
-            for col, ctype in [("branch", "TEXT"), ("markets", "TEXT"), ("extra_args", "TEXT")]:
+            for col, ctype in [
+                ("branch", "TEXT"),
+                ("markets", "TEXT"),
+                ("extra_args", "TEXT"),
+                ("stages", "TEXT"),
+            ]:
                 try:
                     conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ctype}")
                 except Exception:
@@ -72,13 +77,37 @@ class JobStore:
         branch: str | None = None,
         markets: str | None = None,
         extra_args: str | None = None,
+        stage_queues: dict[str, str] | None = None,
     ) -> dict:
         now = datetime.now(timezone.utc).isoformat()
+        stages = (
+            {
+                step: {
+                    "queue": queue,
+                    "status": "pending",
+                    **({"queued_at": now} if index == 0 else {}),
+                }
+                for index, (step, queue) in enumerate(stage_queues.items())
+            }
+            if stage_queues
+            else None
+        )
         with self._connect() as conn:
             conn.execute(
-                """INSERT INTO jobs (job_id, status, version, steps, triggered_by, created_at, branch, markets, extra_args)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (job_id, JobStatus.PENDING, version, json.dumps(steps), triggered_by, now, branch, markets, extra_args),
+                """INSERT INTO jobs (job_id, status, version, steps, triggered_by, created_at, branch, markets, extra_args, stages)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    job_id,
+                    JobStatus.PENDING,
+                    version,
+                    json.dumps(steps),
+                    triggered_by,
+                    now,
+                    branch,
+                    markets,
+                    extra_args,
+                    json.dumps(stages) if stages else None,
+                ),
             )
         return self.get_job(job_id)  # type: ignore[return-value]
 
@@ -89,6 +118,7 @@ class JobStore:
             return None
         data = dict(row)
         data["steps"] = json.loads(data["steps"] or "[]")
+        data["stages"] = json.loads(data.get("stages") or "null")
         if data.get("validation_result"):
             try:
                 data["validation_result"] = json.loads(data["validation_result"])
@@ -114,6 +144,7 @@ class JobStore:
         for row in rows:
             d = dict(row)
             d["steps"] = json.loads(d["steps"] or "[]")
+            d["stages"] = json.loads(d.get("stages") or "null")
             out.append(d)
         return out
 
@@ -161,6 +192,71 @@ class JobStore:
             finished_at=datetime.now(timezone.utc).isoformat(),
             current_step=None,
         )
+
+    def set_stage_running(self, job_id: str, step: str) -> None:
+        stages = self.get_job(job_id, "stages") or {}
+        stage = stages.get(step)
+        if stage is None:
+            return
+        now = datetime.now(timezone.utc)
+        queued_at = datetime.fromisoformat(stage.get("queued_at") or now.isoformat())
+        stage.update(
+            status="running",
+            started_at=now.isoformat(),
+            queue_wait_seconds=max((now - queued_at).total_seconds(), 0),
+        )
+        self.update_job(job_id, stages=json.dumps(stages))
+
+    def set_stage_completed(self, job_id: str, step: str, duration_seconds: float) -> None:
+        stages = self.get_job(job_id, "stages") or {}
+        stage = stages.get(step)
+        if stage is None:
+            return
+        stage.update(
+            status="completed",
+            finished_at=(now := datetime.now(timezone.utc)).isoformat(),
+            duration_seconds=duration_seconds,
+        )
+        stage_ids = list(stages)
+        next_index = stage_ids.index(step) + 1
+        if next_index < len(stage_ids):
+            stages[stage_ids[next_index]]["queued_at"] = now.isoformat()
+        self.update_job(job_id, stages=json.dumps(stages))
+
+    def set_stage_failed(self, job_id: str, step: str, error: str) -> None:
+        stages = self.get_job(job_id, "stages") or {}
+        stage = stages.get(step)
+        if stage is None:
+            return
+        stage.update(
+            status="failed",
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            error=error[:2000],
+        )
+        self.update_job(job_id, stages=json.dumps(stages))
+
+    def fail_running_stage(self, job_id: str, error: str) -> None:
+        stages = self.get_job(job_id, "stages") or {}
+        for step, stage in stages.items():
+            if stage.get("status") == "running":
+                self.set_stage_failed(job_id, step, error)
+                return
+
+    def recover_interrupted_jobs(self) -> list[str]:
+        """Persist failed job and stage state after daemon interruption."""
+        interrupted = self.list_job_ids(status=JobStatus.RUNNING)
+        for job_id in interrupted:
+            error = "Interrupted — server restarted"
+            stages = self.get_job(job_id, "stages") or {}
+            if stages and not any(
+                stage.get("status") in {"running", "failed"}
+                for stage in stages.values()
+            ):
+                self.set_pending(job_id)
+            else:
+                self.fail_running_stage(job_id, error)
+                self.set_failed(job_id, error)
+        return interrupted
 
     def set_validated(self, job_id: str, result: dict) -> None:
         self.update_job(

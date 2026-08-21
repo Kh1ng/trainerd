@@ -136,6 +136,34 @@ def test_trainerd_submit_status_logs_and_cancel_contract(tmp_path: Path) -> None
         _restore_trainerd_server(old_state)
 
 
+def test_trainerd_submit_persists_stage_queue_handoff(tmp_path: Path) -> None:
+    client, old_state = _configure_trainerd_server(tmp_path)
+    try:
+        config_path = server_mod._config_path
+        assert config_path is not None
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        raw["steps"] = [
+            {"id": "prepare", "cmd": "prepare", "queue": "cpu"},
+            {"id": "train", "cmd": "train", "queue": "gpu"},
+        ]
+        config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+        server_mod._config = server_mod.load_config(config_path)
+        server_mod._runner.update_config(server_mod._config, config_path=config_path)
+
+        submitted = client.post(
+            "/api/jobs",
+            json={"version": "v10", "steps": ["train", "prepare"]},
+        )
+        job = client.get(f"/api/jobs/{submitted.json()['job_id']}").json()
+
+        assert job["stages"]["prepare"]["queue"] == "cpu"
+        assert job["stages"]["prepare"]["queued_at"]
+        assert job["stages"]["train"] == {"queue": "gpu", "status": "pending"}
+    finally:
+        client.close()
+        _restore_trainerd_server(old_state)
+
+
 def test_job_artifacts_are_authenticated_and_integrity_checked(tmp_path: Path) -> None:
     client, old_state = _configure_trainerd_server(tmp_path)
     try:
