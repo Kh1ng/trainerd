@@ -279,6 +279,39 @@ def test_gpu_capacity_recovers_after_cancellation_failure_and_restart() -> None:
     assert StageQueuePool(gpu=2).snapshot()["gpu"]["claimed"] == 0
 
 
+def test_restart_with_lower_gpu_capacity_fails_job_with_admission_error(
+    tmp_path: Path,
+) -> None:
+    config = TrainingConfig(
+        project="test",
+        repo=RepoConfig("", "main", str(tmp_path)),
+        work_dir=tmp_path / "work",
+        steps=[StepConfig("train", "Train", "train", queue="gpu", units=2)],
+        validation=None,
+        promotion=None,
+        api_key="",
+        server_port=7860,
+        log_dir=tmp_path / "logs",
+    )
+    config.log_dir.mkdir()
+    store = JobStore(tmp_path / "jobs.db")
+    store.create_job(
+        "job-a",
+        ["train"],
+        "v1",
+        stage_queues={"train": "gpu"},
+        stage_units={"train": 2},
+    )
+
+    asyncio.run(JobRunner(store, config, queues=StageQueuePool(gpu=1)).run_job("job-a"))
+
+    job = store.get_job("job-a")
+    error = "GPU stage requests 2 units but capacity is 1"
+    assert job["status"] == "failed"
+    assert job["error"] == f"Step 'train' queue admission failed: {error}"
+    assert job["stages"]["train"]["error"] == error
+
+
 def test_same_repo_jobs_use_pinned_worktrees_and_isolated_work_dirs(
     tmp_path: Path, monkeypatch
 ) -> None:

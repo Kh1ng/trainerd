@@ -68,10 +68,18 @@ class StageQueuePool:
         try:
             yield
         finally:
-            async with self._changed:
-                self._claimed[queue] -= units
-                self._running[queue] -= 1
-                self._changed.notify_all()
+            release = asyncio.create_task(self._release(queue, units))
+            try:
+                await asyncio.shield(release)
+            except asyncio.CancelledError:
+                await release
+                raise
+
+    async def _release(self, queue: str, units: int) -> None:
+        async with self._changed:
+            self._claimed[queue] -= units
+            self._running[queue] -= 1
+            self._changed.notify_all()
 
     def snapshot(self) -> dict[str, dict[str, int | float]]:
         return {
@@ -295,8 +303,19 @@ class JobRunner:
                     if prior.get("status") == "completed":
                         _log(f"--- Step already completed before restart: {step.name} ---")
                         continue
+                    units = prior.get("units", 1)
                     try:
-                        async with self._queues.claim(queue, prior.get("units", 1)):
+                        self._queues.validate(queue, units)
+                    except ValueError as exc:
+                        self._store.set_stage_failed(job_id, step.id, str(exc))
+                        self._store.set_failed(
+                            job_id,
+                            f"Step '{step.id}' queue admission failed: {exc}",
+                        )
+                        _log(f"FAILED queue admission for step {step.id}: {exc}")
+                        return
+                    try:
+                        async with self._queues.claim(queue, units):
                             self._store.set_running(job_id, step.id)
                             self._store.set_stage_running(job_id, step.id)
                             started = time.perf_counter()
