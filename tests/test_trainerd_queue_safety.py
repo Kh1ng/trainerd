@@ -1,5 +1,7 @@
 import asyncio
 import io
+import subprocess
+import sys
 from types import SimpleNamespace
 
 
@@ -46,10 +48,8 @@ def test_run_cmd_requests_new_session_on_posix(monkeypatch):
     captured = {}
 
     class Output:
-        def __aiter__(self):
-            async def rows():
-                yield b"ok\n"
-            return rows().__aiter__()
+        async def read(self, size):
+            return b""
 
     class Process:
         pid = 1234
@@ -67,6 +67,27 @@ def test_run_cmd_requests_new_session_on_posix(monkeypatch):
     ok = asyncio.run(runner._run_cmd("echo ok", None, io.StringIO(), None, 5))
     assert ok is True
     assert captured["start_new_session"] is True
+
+
+def test_run_cmd_streams_output_larger_than_reader_line_limit(tmp_path):
+    import trainerd.runner as runner
+
+    script = tmp_path / "large_output.py"
+    script.write_text("import sys\nsys.stdout.write('x' * 65537)\n", encoding="utf-8")
+    output = io.StringIO()
+
+    ok = asyncio.run(
+        runner._run_cmd(
+            subprocess.list2cmdline([sys.executable, str(script)]),
+            None,
+            output,
+            None,
+            5,
+        )
+    )
+
+    assert ok is True
+    assert output.getvalue() == "x" * 65537
 
 
 def test_cancel_uses_process_group_termination(monkeypatch):

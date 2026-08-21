@@ -6,6 +6,7 @@ and optionally promotes model artifacts back to the git repo.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import fnmatch
 import json
 import logging
@@ -386,10 +387,12 @@ async def _run_cmd(
             proc_store[job_id] = proc
         try:
             async def _drain_stdout() -> None:
-                async for line in proc.stdout:  # type: ignore[union-attr]
-                    decoded = line.decode("utf-8", errors="replace").rstrip()
-                    logfile.write(decoded + "\n")
+                decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                while chunk := await proc.stdout.read(64 * 1024):  # type: ignore[union-attr]
+                    logfile.write(decoder.decode(chunk))
                     logfile.flush()
+                logfile.write(decoder.decode(b"", final=True))
+                logfile.flush()
 
             await asyncio.wait_for(_drain_stdout(), timeout=timeout)
         except asyncio.TimeoutError:
