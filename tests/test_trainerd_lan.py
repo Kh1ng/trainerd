@@ -14,6 +14,7 @@ from trainerd.lan import (
     LanConfigError,
     LanPreparedProject,
     load_lan_task,
+    normalize_branch,
     normalize_repo_url,
     repo_key,
 )
@@ -101,6 +102,17 @@ def test_lan_repo_accepts_only_anonymous_http_urls(value: str) -> None:
         normalize_repo_url("HTTP://GIT.LOCAL:8080/team/repo.git/")
         == "http://git.local:8080/team/repo.git"
     )
+
+
+@pytest.mark.parametrize("value", ["feature/mod4", "release-0.3", "user/topic_1"])
+def test_lan_branch_uses_git_ref_rules(value: str) -> None:
+    assert normalize_branch(value) == value
+
+
+@pytest.mark.parametrize("value", ["", " HEAD", "HEAD", "bad..branch", "bad branch"])
+def test_lan_branch_rejects_invalid_names(value: str) -> None:
+    with pytest.raises(LanConfigError, match="branch"):
+        normalize_branch(value)
 
 
 def test_lan_manifest_resolves_managed_paths(tmp_path: Path) -> None:
@@ -296,6 +308,7 @@ def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
                 json={
                     "repo": "http://git.local/team/repo.git",
                     "task": "nfl-train",
+                    "branch": "feature/mod4",
                 },
             )
 
@@ -305,8 +318,14 @@ def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
         assert result["project"] == prepared.project
         assert result["steps"] == ["train"]
         assert result["queued"] is True
-        prepare.assert_called_once()
+        prepare.assert_called_once_with(
+            server._lan_state_dir,
+            "http://git.local/team/repo.git",
+            "nfl-train",
+            branch="feature/mod4",
+        )
         runtime = server._projects[prepared.project]
+        assert runtime.store.get_job(result["job_id"])["branch"] == "feature/mod4"
         assert runtime.store.get_job(result["job_id"])
         assert client.get("/api/health").json()["mode"] == "lan"
 
