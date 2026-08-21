@@ -78,8 +78,13 @@ The daemon clones or fast-forwards its own managed checkout and loads
 trainerd submit `
   --server-url http://127.0.0.1:7860 `
   --repo http://git.local/Khing/sportsball-bets.git `
-  --task nfl-train
+  --task nfl-train `
+  --branch feature/training
 ```
+
+The branch is optional. If omitted, trainerd uses the managed checkout's
+current branch or the repository's default branch on the first clone. Branch
+names must pass Git's native branch-name validation.
 
 ```yaml
 version: 1

@@ -100,7 +100,25 @@ def repo_key(repo_url: str) -> str:
     return hashlib.sha256(repo_url.encode("utf-8")).hexdigest()[:20]
 
 
-def prepare_lan_project(state_dir: Path, repo_url: str, task: str) -> LanPreparedProject:
+def normalize_branch(value: str) -> str:
+    """Validate a branch name with Git's own ref rules."""
+    if not isinstance(value, str) or not value or len(value) > 255 or value != value.strip():
+        raise LanConfigError("branch must contain 1-255 characters without outer whitespace")
+    if value == "HEAD":
+        raise LanConfigError("branch must name a branch, not HEAD")
+    result = _run_git(["git", "check-ref-format", "--branch", value], check=False)
+    if result.returncode != 0 or result.stdout.strip() != value:
+        raise LanConfigError("branch is not a valid Git branch name")
+    return value
+
+
+def prepare_lan_project(
+    state_dir: Path,
+    repo_url: str,
+    task: str,
+    *,
+    branch: str | None = None,
+) -> LanPreparedProject:
     """Clone/update a managed checkout and load one task from `.trainerd.yaml`."""
     normalized_url = normalize_repo_url(repo_url)
     task = _safe_id(task, "task")
@@ -109,6 +127,7 @@ def prepare_lan_project(state_dir: Path, repo_url: str, task: str) -> LanPrepare
     checkout = state_dir / "repos" / key
     checkout.parent.mkdir(parents=True, exist_ok=True)
 
+    selected_branch = normalize_branch(branch) if branch is not None else None
     if checkout.exists():
         if not (checkout / ".git").is_dir():
             raise LanConfigError(f"Managed checkout is not a Git repository: {checkout}")
@@ -116,15 +135,20 @@ def prepare_lan_project(state_dir: Path, repo_url: str, task: str) -> LanPrepare
         if normalize_repo_url(actual_url) != normalized_url:
             raise LanConfigError("Managed checkout origin does not match requested repo")
         _require_clean_tracked_checkout(checkout)
-        branch = _git(checkout, "branch", "--show-current").strip()
-        if not branch or not _SAFE_ID.fullmatch(branch):
-            raise LanConfigError("Managed checkout must be on a simple named branch")
-        _git(checkout, "pull", "--ff-only", "origin", branch)
+        _git(checkout, "fetch", "origin")
+        if selected_branch is not None:
+            _git(checkout, "checkout", selected_branch)
+        selected_branch = _git(checkout, "branch", "--show-current").strip()
+        if not selected_branch:
+            raise LanConfigError("Managed checkout must be on a named branch")
+        _git(checkout, "pull", "--ff-only", "origin", selected_branch)
     else:
         _run_git(["git", "clone", "--origin", "origin", "--", normalized_url, str(checkout)])
-        branch = _git(checkout, "branch", "--show-current").strip()
-        if not branch or not _SAFE_ID.fullmatch(branch):
-            raise LanConfigError("Cloned repository must have a simple default branch")
+        if selected_branch is not None:
+            _git(checkout, "checkout", selected_branch)
+        selected_branch = _git(checkout, "branch", "--show-current").strip()
+        if not selected_branch:
+            raise LanConfigError("Cloned repository must be on a named branch")
 
     manifest = checkout / ".trainerd.yaml"
     resolved_manifest = manifest.resolve()
@@ -142,7 +166,7 @@ def prepare_lan_project(state_dir: Path, repo_url: str, task: str) -> LanPrepare
         project=project,
         repo_url=normalized_url,
         repo_path=checkout,
-        branch=branch,
+        branch=selected_branch,
         work_dir=work_dir,
         log_dir=log_dir,
     )
