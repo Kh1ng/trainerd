@@ -417,12 +417,14 @@ async def _terminate_proc_tree(proc: asyncio.subprocess.Process | None) -> bool:
         return False
     try:
         if os.name == "nt":
-            subprocess.run(
+            result = subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
+            if result.returncode != 0:
+                return False
         else:
             os.killpg(proc.pid, signal.SIGTERM)
         try:
