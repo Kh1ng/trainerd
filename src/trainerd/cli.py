@@ -78,6 +78,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         state_dir=args.state_dir,
         max_concurrent_jobs=args.max_concurrent_jobs,
         cpu_concurrency=args.cpu_concurrency,
+        gpu_capacity=args.gpu_capacity,
         allowed_repos=args.allow_repo,
     )
     return 0
@@ -234,6 +235,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--cpu-concurrency",
         type=int,
         help="CPU stage concurrency across all projects (default: 1).",
+    )
+    serve.add_argument(
+        "--gpu-capacity",
+        type=int,
+        help="GPU capacity units shared across all projects (default: 1).",
     )
     serve.add_argument(
         "--allow-repo",

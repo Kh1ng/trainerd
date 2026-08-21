@@ -455,7 +455,11 @@ async def _lifespan(app: FastAPI):
         cpu_limit = int(os.environ.get("TRAINERD_CPU_CONCURRENCY", "1"))
     except ValueError as exc:
         raise ValueError("TRAINERD_CPU_CONCURRENCY must be an integer") from exc
-    _stage_queues = StageQueuePool(cpu=cpu_limit, gpu=1)
+    try:
+        gpu_capacity = int(os.environ.get("TRAINERD_GPU_CAPACITY", "1"))
+    except ValueError as exc:
+        raise ValueError("TRAINERD_GPU_CAPACITY must be an integer") from exc
+    _stage_queues = StageQueuePool(cpu=cpu_limit, gpu=gpu_capacity)
     _lan_mode_active = os.environ.get("TRAINERD_LAN_MODE") == "1"
     _projects = {}
     allowed_repos: frozenset[str] = frozenset()
@@ -671,6 +675,13 @@ def _queue_job(runtime: ProjectRuntime, payload: dict[str, Any]) -> dict:
             raise HTTPException(status_code=400, detail="No valid step ids requested")
     else:
         steps = configured_step_ids
+    if _stage_queues:
+        try:
+            for step in config.steps:
+                if step.id in steps and step.queue:
+                    _stage_queues.validate(step.queue, step.units)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     version = _normalize_version(payload.get("version")) or _next_version(config)
     branch = payload.get("branch")
     markets = payload.get("markets")
@@ -703,6 +714,7 @@ def _queue_job(runtime: ProjectRuntime, payload: dict[str, Any]) -> dict:
         stage_queues={step.id: step.queue for step in config.steps if step.id in steps}
         if config.steps and all(step.queue for step in config.steps)
         else None,
+        stage_units={step.id: step.units for step in config.steps if step.id in steps},
     )
     _wake_queue()
     log.info(
@@ -874,11 +886,18 @@ async def get_job(job_id: str) -> dict:
     found = _find_job_runtime(job_id)
     if found:
         runtime, job = found
-        return _with_project(runtime, job)
+        return {
+            **_with_project(runtime, job),
+            "stage_queues": _stage_queues.snapshot() if _stage_queues else None,
+        }
     persisted = _find_persisted_lan_job(job_id)
     if persisted:
         project, _, _, job = persisted
-        return {**job, "project": project}
+        return {
+            **job,
+            "project": project,
+            "stage_queues": _stage_queues.snapshot() if _stage_queues else None,
+        }
     raise HTTPException(status_code=404, detail="Job not found")
 
 
@@ -1128,6 +1147,7 @@ def main(
     state_dir: str | None = None,
     max_concurrent_jobs: int | None = None,
     cpu_concurrency: int | None = None,
+    gpu_capacity: int | None = None,
     allowed_repos: list[str] | None = None,
 ) -> None:
     if not lan and (
@@ -1144,6 +1164,10 @@ def main(
         if not 1 <= cpu_concurrency <= 64:
             raise ValueError("--cpu-concurrency must be from 1 to 64")
         os.environ["TRAINERD_CPU_CONCURRENCY"] = str(cpu_concurrency)
+    if gpu_capacity is not None:
+        if not 1 <= gpu_capacity <= 64:
+            raise ValueError("--gpu-capacity must be from 1 to 64")
+        os.environ["TRAINERD_GPU_CAPACITY"] = str(gpu_capacity)
     if lan:
         os.environ["TRAINERD_LAN_MODE"] = "1"
         os.environ.pop("TRAINERD_PROJECTS_CONFIG", None)

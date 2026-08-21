@@ -138,7 +138,7 @@ def test_lan_manifest_loads_explicit_stage_queues(tmp_path: Path) -> None:
     raw = yaml.safe_load(manifest.read_text(encoding="utf-8"))
     raw["tasks"]["nfl-train"]["steps"] = [
         {"id": "prepare", "cmd": "prepare", "queue": "cpu"},
-        {"id": "train", "cmd": "train", "queue": "gpu"},
+        {"id": "train", "cmd": "train", "queue": "gpu", "units": 2},
     ]
     manifest.write_text(yaml.safe_dump(raw), encoding="utf-8")
 
@@ -154,6 +154,7 @@ def test_lan_manifest_loads_explicit_stage_queues(tmp_path: Path) -> None:
     )
 
     assert [step.queue for step in config.steps] == ["cpu", "gpu"]
+    assert [step.units for step in config.steps] == [1, 2]
 
 
 def test_lan_manifest_rejects_cwd_escape_and_unknown_fields(tmp_path: Path) -> None:
@@ -259,8 +260,17 @@ def test_cli_lan_mode_has_zero_config_listener_defaults() -> None:
         state_dir=None,
         max_concurrent_jobs=None,
         cpu_concurrency=None,
+        gpu_capacity=None,
         allowed_repos=None,
     )
+
+
+def test_cli_passes_gpu_capacity() -> None:
+    with patch("trainerd.server.main") as serve:
+        rc = trainerd_main(["serve", "--lan", "--gpu-capacity", "3"])
+
+    assert rc == 0
+    assert serve.call_args.kwargs["gpu_capacity"] == 3
 
 
 def test_cli_lan_mode_passes_repository_allowlist() -> None:

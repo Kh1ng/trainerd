@@ -5,6 +5,7 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
 import yaml
 
 import trainerd.runner as runner_module
@@ -155,6 +156,127 @@ def test_cpu_preparation_overlaps_gpu_without_concurrent_gpu_stages(
         assert job["stages"]["train"]["status"] == "completed"
         assert job["stages"]["train"]["queue_wait_seconds"] >= 0
         assert job["stages"]["train"]["duration_seconds"] > 0
+
+
+def test_partial_gpu_stages_overlap_while_full_capacity_stage_is_exclusive(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = TrainingConfig(
+        project="test",
+        repo=RepoConfig("", "main", str(tmp_path)),
+        work_dir=tmp_path / "work",
+        steps=[
+            StepConfig("small", "Small", "small", queue="gpu", units=1),
+            StepConfig("full", "Full", "full", queue="gpu", units=2),
+        ],
+        validation=None,
+        promotion=None,
+        api_key="",
+        server_port=7860,
+        log_dir=tmp_path / "logs",
+        max_concurrent_jobs=4,
+    )
+    config.log_dir.mkdir()
+    store = JobStore(tmp_path / "jobs.db")
+    for job_id, step, units in (
+        ("small-a", "small", 1),
+        ("small-b", "small", 1),
+        ("full", "full", 2),
+        ("small-late", "small", 1),
+    ):
+        store.create_job(
+            job_id,
+            [step],
+            "v1",
+            stage_queues={step: "gpu"},
+            stage_units={step: units},
+        )
+
+    pool = StageQueuePool(cpu=1, gpu=2)
+    partials_started = asyncio.Event()
+    release_partials = asyncio.Event()
+    full_started = asyncio.Event()
+    release_full = asyncio.Event()
+    late_started = asyncio.Event()
+    active_units = 0
+    partial_count = 0
+
+    async def fake_run_cmd(cmd, cwd, logfile, env, timeout, **kwargs):
+        nonlocal active_units, partial_count
+        units = 2 if cmd == "full" else 1
+        assert active_units + units <= 2
+        active_units += units
+        if env["TRAINERD_JOB_ID"] in {"small-a", "small-b"}:
+            partial_count += 1
+            if partial_count == 2:
+                partials_started.set()
+            await asyncio.wait_for(release_partials.wait(), timeout=5)
+        elif cmd == "full":
+            assert active_units == 2
+            full_started.set()
+            await asyncio.wait_for(release_full.wait(), timeout=5)
+        else:
+            late_started.set()
+        active_units -= units
+        return True
+
+    monkeypatch.setattr(runner_module, "_run_cmd", fake_run_cmd)
+    runner = JobRunner(store, config, queues=pool)
+
+    async def run_jobs() -> None:
+        partials = [
+            asyncio.create_task(runner.run_job("small-a")),
+            asyncio.create_task(runner.run_job("small-b")),
+        ]
+        await asyncio.wait_for(partials_started.wait(), timeout=5)
+        assert pool.snapshot()["gpu"] == {
+            "running": 2,
+            "total": 2,
+            "limit": 2,
+            "claimed": 2,
+            "available": 0,
+            "occupancy": 1,
+        }
+        full = asyncio.create_task(runner.run_job("full"))
+        await asyncio.sleep(0.01)
+        assert not full_started.is_set()
+        release_partials.set()
+        await asyncio.wait_for(full_started.wait(), timeout=5)
+        late = asyncio.create_task(runner.run_job("small-late"))
+        await asyncio.sleep(0.01)
+        assert not late_started.is_set()
+        release_full.set()
+        await asyncio.gather(*partials, full, late)
+
+    asyncio.run(run_jobs())
+
+    assert late_started.is_set()
+    assert pool.snapshot()["gpu"]["available"] == 2
+
+
+def test_gpu_capacity_recovers_after_cancellation_failure_and_restart() -> None:
+    async def exercise() -> None:
+        pool = StageQueuePool(gpu=2)
+        claimed = asyncio.Event()
+
+        async def cancelled_claim() -> None:
+            async with pool.claim("gpu", 2):
+                claimed.set()
+                await asyncio.Event().wait()
+
+        task = asyncio.create_task(cancelled_claim())
+        await claimed.wait()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert pool.snapshot()["gpu"]["available"] == 2
+
+        with pytest.raises(RuntimeError, match="failed"):
+            async with pool.claim("gpu", 2):
+                raise RuntimeError("failed")
+        assert pool.snapshot()["gpu"]["available"] == 2
+
+    asyncio.run(exercise())
+    assert StageQueuePool(gpu=2).snapshot()["gpu"]["claimed"] == 0
 
 
 def test_same_repo_jobs_use_pinned_worktrees_and_isolated_work_dirs(

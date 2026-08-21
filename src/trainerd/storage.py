@@ -86,12 +86,14 @@ class JobStore:
         extra_args: str | None = None,
         repo_sha: str | None = None,
         stage_queues: dict[str, str] | None = None,
+        stage_units: dict[str, int] | None = None,
     ) -> dict:
         now = datetime.now(timezone.utc).isoformat()
         stages = (
             {
                 step: {
                     "queue": queue,
+                    "units": (stage_units or {}).get(step, 1),
                     "status": "pending",
                     **({"queued_at": now} if index == 0 else {}),
                 }
