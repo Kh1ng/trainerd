@@ -17,10 +17,12 @@ import subprocess
 import tempfile
 import time
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import TrainingConfig, load_config
+from .lan import LanConfigError, load_lan_job_config
 from .storage import JobStatus, JobStore
 
 log = logging.getLogger(__name__)
@@ -72,11 +74,13 @@ class JobRunner:
         *,
         config_path: Path | None = None,
         queues: StageQueuePool | None = None,
+        workspace_lock: asyncio.Lock | None = None,
     ) -> None:
         self._store = store
         self._config = config
         self._config_path = config_path
         self._queues = queues or StageQueuePool()
+        self._workspace_lock = workspace_lock or asyncio.Lock()
         # TrainingConfig always has project. getattr preserves lightweight
         # test/embedding stubs that only exercise promotion helpers.
         self._project = getattr(config, "project", None)
@@ -98,6 +102,27 @@ class JobRunner:
         proc = self._running_procs.get(job_id)
         return await _terminate_proc_tree(proc)
 
+    def recover_interrupted_jobs(self) -> list[str]:
+        """Recover persisted jobs and remove worktrees for jobs that became terminal."""
+        recovered = self._store.recover_interrupted_jobs()
+        for job_id in recovered:
+            job = self._store.get_job(job_id) or {}
+            if job.get("status") != JobStatus.PENDING and job.get("repo_sha"):
+                try:
+                    _remove_job_worktree(self._config, job_id)
+                except RepoSyncError as exc:
+                    log.warning("Could not clean recovered job %s worktree: %s", job_id, exc)
+        return recovered
+
+    async def _workspace_operation(self, operation, *args) -> None:
+        async with self._workspace_lock:
+            task = asyncio.create_task(asyncio.to_thread(operation, *args))
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                await task
+                raise
+
     def _load_current_config(self) -> TrainingConfig:
         if self._config_path is None:
             return self._config
@@ -114,10 +139,65 @@ class JobRunner:
         job = self._store.get_job(job_id)
         if not job:
             return
+        if job["status"] in (JobStatus.FAILED, JobStatus.PROMOTED, JobStatus.COMPLETED):
+            return
+        repo_sha = str(job.get("repo_sha") or "")
+        if not repo_sha:
+            await self._execute_job(job_id)
+            return
+
+        config = self._load_current_config()
+        work_dir = (config.work_dir / job_id).resolve()
+        checkout = work_dir / "checkout"
+        try:
+            await self._workspace_operation(
+                _prepare_job_worktree,
+                config,
+                checkout,
+                repo_sha,
+                lambda message: log.info("[job:%s] %s", job_id, message),
+            )
+        except RepoSyncError as exc:
+            self._store.set_failed(job_id, f"Repository checkout failed: {exc}")
+            log.error("[job:%s] checkout failed: %s", job_id, exc)
+            return
+
+        try:
+            try:
+                pinned_config = load_lan_job_config(
+                    config,
+                    checkout,
+                    branch=job.get("branch") or config.repo.branch,
+                )
+            except LanConfigError as exc:
+                self._store.set_failed(job_id, f"Pinned task config failed: {exc}")
+                log.error("[job:%s] pinned task config failed: %s", job_id, exc)
+                return
+            await self._execute_job(
+                job_id,
+                config=_config_for_job(pinned_config, work_dir),
+                repo_sha=repo_sha,
+            )
+        finally:
+            try:
+                await self._workspace_operation(_remove_job_worktree, config, job_id)
+            except RepoSyncError as exc:
+                log.warning("[job:%s] could not remove checkout: %s", job_id, exc)
+
+    async def _execute_job(
+        self,
+        job_id: str,
+        *,
+        config: TrainingConfig | None = None,
+        repo_sha: str = "",
+    ) -> None:
+        job = self._store.get_job(job_id)
+        if not job:
+            return
         # Don't start if the job was already cancelled/marked failed
         if job["status"] in (JobStatus.FAILED, JobStatus.PROMOTED, JobStatus.COMPLETED):
             return
-        config = self._load_current_config()
+        config = config or self._load_current_config()
         log_path = config.log_dir / f"{job_id}.log"
         requested_steps = set(job.get("steps") or [])
         configured_steps = {s.id: s for s in config.steps}
@@ -144,8 +224,7 @@ class JobRunner:
 
             _log(f"=== Job {job_id} starting. version={version} steps={step_ids} ===")
 
-            repo_sha = ""
-            if config.repo.sync_before_job:
+            if not repo_sha and config.repo.sync_before_job:
                 try:
                     repo_sha = _sync_repo_checkout(config.repo, branch=branch, log_fn=_log)
                 except RepoSyncError as exc:
@@ -154,7 +233,8 @@ class JobRunner:
                     return
 
             for step_id in step_ids:
-                config = self._load_current_config()
+                if not job.get("repo_sha"):
+                    config = self._load_current_config()
                 configured_steps = {s.id: s for s in config.steps}
                 step = configured_steps.get(step_id)
                 if step is None:
@@ -178,7 +258,9 @@ class JobRunner:
                     for k, v in (step.env or {}).items()
                 } if step.env else None
                 resolved_env = _with_repo_pythonpath(repo_path, resolved_env)
-                artifact_dir = (config.work_dir / job_id).resolve()
+                artifact_dir = (
+                    config.work_dir if job.get("repo_sha") else config.work_dir / job_id
+                ).resolve()
                 artifact_dir.mkdir(parents=True, exist_ok=True)
                 resolved_env["TRAINERD_JOB_ID"] = job_id
                 resolved_env["TRAINERD_ARTIFACT_DIR"] = str(artifact_dir)
@@ -240,7 +322,8 @@ class JobRunner:
             _log("=== All steps completed. Running validation... ===")
             self._store.set_completed(job_id)
 
-            config = self._load_current_config()
+            if not job.get("repo_sha"):
+                config = self._load_current_config()
             if config.validation:
                 ok, result = await _validate(
                     config.validation,
@@ -339,6 +422,56 @@ class JobRunner:
         _log(f"Promoted. git ref: {ref_out}")
 
 
+def _config_for_job(
+    config: TrainingConfig,
+    work_dir: Path,
+) -> TrainingConfig:
+    """Bind managed repository and work paths to one isolated job."""
+    base_repo = str(Path(config.repo.local_path).resolve())
+    base_work = str(config.work_dir.resolve())
+    job_work = str(work_dir.resolve())
+    repo_marker = "\0trainerd-repo\0"
+
+    def bind(value: str | None) -> str | None:
+        if value is None:
+            return None
+        return (
+            value.replace(base_repo, repo_marker)
+            .replace(base_work, job_work)
+            .replace(repo_marker, base_repo)
+        )
+
+    steps = [
+        replace(
+            step,
+            cmd=bind(step.cmd) or "",
+            cwd=bind(step.cwd),
+            env={name: bind(value) or "" for name, value in step.env.items()},
+        )
+        for step in config.steps
+    ]
+    validation = (
+        replace(
+            config.validation,
+            cmd=bind(config.validation.cmd) or "",
+            cwd=bind(config.validation.cwd),
+            env={
+                name: bind(value) or ""
+                for name, value in config.validation.env.items()
+            },
+        )
+        if config.validation
+        else None
+    )
+    return replace(
+        config,
+        repo=replace(config.repo, sync_before_job=False),
+        work_dir=work_dir.resolve(),
+        steps=steps,
+        validation=validation,
+    )
+
+
 def _resolve_template(
     template: str,
     version: str = "",
@@ -403,37 +536,84 @@ def _sync_repo_checkout(repo, *, branch: str, log_fn) -> str:
     if not (repo_path / ".git").is_dir():
         raise RepoSyncError(f"Not a Git checkout: {repo_path}")
 
-    def run(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(repo_path), *args],
-                capture_output=True,
-                text=True,
-                timeout=300,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise RepoSyncError(str(exc)) from exc
-        if check and result.returncode != 0:
-            detail = (result.stderr or result.stdout).strip()[-2000:]
-            raise RepoSyncError(detail or f"git {' '.join(args)} failed")
-        return result
-
     for args in (("diff", "--quiet"), ("diff", "--cached", "--quiet")):
-        result = run(*args, check=False)
+        result = _run_repo_git(repo_path, *args, check=False)
         if result.returncode == 1:
             raise RepoSyncError("Checkout has tracked changes; refusing to update")
         if result.returncode != 0:
             raise RepoSyncError((result.stderr or result.stdout).strip())
 
     log_fn(f"Syncing {repo_path} to origin/{branch} with fast-forward only")
-    run("checkout", branch)
-    run("pull", "--ff-only", "origin", branch)
-    revision = run("rev-parse", "HEAD").stdout.strip()
+    _run_repo_git(repo_path, "checkout", branch)
+    _run_repo_git(repo_path, "pull", "--ff-only", "origin", branch)
+    revision = _run_repo_git(repo_path, "rev-parse", "HEAD").stdout.strip()
     if not revision:
         raise RepoSyncError("Git returned an empty HEAD revision")
     log_fn(f"Repository revision: {revision}")
     return revision
+
+
+def _run_repo_git(
+    repo_path: Path,
+    *args: str,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), *args],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RepoSyncError(str(exc)) from exc
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()[-2000:]
+        raise RepoSyncError(detail or f"git {' '.join(args)} failed")
+    return result
+
+
+def _prepare_job_worktree(
+    config: TrainingConfig,
+    checkout: Path,
+    revision: str,
+    log_fn,
+) -> None:
+    """Create or verify the detached worktree for one persisted job revision."""
+    base_repo = Path(config.repo.local_path).expanduser().resolve()
+    if not (base_repo / ".git").is_dir():
+        raise RepoSyncError(f"Not a Git checkout: {base_repo}")
+    if checkout.exists():
+        if not (checkout / ".git").exists():
+            raise RepoSyncError(f"Job checkout is not a Git worktree: {checkout}")
+        actual = _run_repo_git(checkout, "rev-parse", "HEAD").stdout.strip()
+        if actual != revision:
+            raise RepoSyncError(
+                f"Job checkout revision {actual or 'unknown'} does not match {revision}"
+            )
+        log_fn(f"Reusing job checkout {checkout} at {revision}")
+        return
+
+    checkout.parent.mkdir(parents=True, exist_ok=True)
+    _run_repo_git(base_repo, "worktree", "prune")
+    _run_repo_git(base_repo, "worktree", "add", "--detach", str(checkout), revision)
+    actual = _run_repo_git(checkout, "rev-parse", "HEAD").stdout.strip()
+    if actual != revision:
+        raise RepoSyncError(f"Git created job checkout at {actual or 'unknown'}, expected {revision}")
+    log_fn(f"Created job checkout {checkout} at {revision}")
+
+
+def _remove_job_worktree(config: TrainingConfig, job_id: str) -> None:
+    """Remove one job checkout while retaining its work directory and artifacts."""
+    base_repo = Path(config.repo.local_path).expanduser().resolve()
+    checkout = config.work_dir.resolve() / job_id / "checkout"
+    if not checkout.exists():
+        _run_repo_git(base_repo, "worktree", "prune")
+        return
+    _run_repo_git(base_repo, "worktree", "remove", "--force", str(checkout))
+    if checkout.exists():
+        raise RepoSyncError(f"Git did not remove job checkout: {checkout}")
 
 
 async def _run_cmd(

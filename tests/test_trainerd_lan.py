@@ -82,6 +82,7 @@ def _prepared(tmp_path: Path) -> LanPreparedProject:
         task="nfl-train",
         repo_path=repo_path,
         manifest_path=manifest_path,
+        revision="a" * 40,
         config=config,
     )
 
@@ -373,6 +374,37 @@ def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
         assert validating.status_code == 409
         prepare_again.assert_not_called()
         server._running_tasks.pop(result["job_id"], None)
+
+        prepared.config.max_concurrent_jobs = 2
+        with patch("trainerd.server.prepare_lan_project", return_value=prepared):
+            first = client.post(
+                "/api/jobs",
+                json={
+                    "repo": "http://git.local/team/repo.git",
+                    "task": "nfl-train",
+                    "version": "v2",
+                },
+            )
+            second = client.post(
+                "/api/jobs",
+                json={
+                    "repo": "http://git.local/team/repo.git",
+                    "task": "nfl-train",
+                    "version": "v3",
+                },
+            )
+            full = client.post(
+                "/api/jobs",
+                json={
+                    "repo": "http://git.local/team/repo.git",
+                    "task": "nfl-train",
+                    "version": "v4",
+                },
+            )
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert full.status_code == 409
+        assert runtime.store.get_job(first.json()["job_id"])["repo_sha"] == prepared.revision
 
         incompatible = client.post(
             "/api/jobs",

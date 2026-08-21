@@ -128,9 +128,9 @@ Task manifests are bounded and working directories cannot escape the daemon's
 managed checkout or work directory. The commands in `.trainerd.yaml` are still
 executable code from the repository.
 
-LAN mode runs at most one queued, running, or validating job per repository so
-that checkout updates cannot race repository-owned commands. The daemon-wide
-concurrency setting applies across different repositories.
+LAN tasks default to one queued, running, or validating job per repository.
+Set a task's `max_concurrent_jobs` above one to allow jobs from that repository
+to overlap. The daemon-wide limit still caps total active jobs.
 
 When every task step sets `queue: cpu` or `queue: gpu`, trainerd persists each
 stage handoff and admits it through a daemon-wide queue. The GPU queue is fixed
@@ -139,11 +139,12 @@ at one stage for the configured GPU. Set CPU capacity with
 status includes stage wait/duration metrics, and `/api/health` reports live
 queue occupancy. Stages in one job share `TRAINERD_ARTIFACT_DIR`.
 
-Immediately before a LAN job starts, trainerd verifies that the managed
-checkout has no tracked changes and fast-forwards it to its configured remote
-branch. The exact revision is logged and exported to every step and validation
-command as `TRAINERD_REPO_SHA`. A dirty checkout or non-fast-forward update
-fails the job before repository code runs.
+At submission, trainerd verifies that the managed checkout has no tracked
+changes, fast-forwards it, and saves the exact revision. Each job runs in a
+detached Git worktree at that revision with its own work directory. Trainerd
+exports the revision as `TRAINERD_REPO_SHA`. It removes the worktree when the
+job ends but retains the work directory and declared artifacts. The CPU queue
+serializes preparation when shared environment setup must not overlap.
 
 **LAN mode has no authentication. Anyone who can reach the port can run tasks
 from an HTTP Git repository. Keep it behind the host firewall on a trusted LAN.

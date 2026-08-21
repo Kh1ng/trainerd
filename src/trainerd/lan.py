@@ -46,6 +46,7 @@ class LanPreparedProject:
     task: str
     repo_path: Path
     manifest_path: Path
+    revision: str
     config: TrainingConfig
 
 
@@ -151,6 +152,9 @@ def prepare_lan_project(
             raise LanConfigError("Cloned repository must be on a named branch")
 
     manifest = checkout / ".trainerd.yaml"
+    revision = _git(checkout, "rev-parse", "HEAD").strip()
+    if not revision:
+        raise LanConfigError("Managed checkout has no Git revision")
     resolved_manifest = manifest.resolve()
     if not manifest.is_file() or not _within(resolved_manifest, checkout.resolve()):
         raise LanConfigError("Repository root must contain a regular .trainerd.yaml file")
@@ -178,6 +182,7 @@ def prepare_lan_project(
         task=task,
         repo_path=checkout,
         manifest_path=resolved_manifest,
+        revision=revision,
         config=config,
     )
 
@@ -200,6 +205,37 @@ def inject_managed_env(config: TrainingConfig, state_dir: Path) -> None:
         step.env = {**step.env, **selected_env}
     if config.validation is not None:
         config.validation.env = {**config.validation.env, **selected_env}
+
+
+def load_lan_job_config(
+    current: TrainingConfig,
+    checkout: Path,
+    *,
+    branch: str,
+) -> TrainingConfig:
+    """Load a LAN task from its pinned job checkout using daemon-owned paths."""
+    normalized_url = normalize_repo_url(current.repo.url)
+    key = repo_key(normalized_url)
+    project_prefix = f"lan-{key}-"
+    if not current.project.startswith(project_prefix):
+        raise LanConfigError(f"Invalid managed LAN project id: {current.project}")
+    task = current.project.removeprefix(project_prefix)
+    base_checkout = Path(current.repo.local_path).resolve()
+    state_dir = base_checkout.parent.parent
+    if base_checkout != state_dir / "repos" / key:
+        raise LanConfigError("Managed LAN checkout is outside the state repository directory")
+    config = load_lan_task(
+        checkout / ".trainerd.yaml",
+        task=task,
+        project=current.project,
+        repo_url=normalized_url,
+        repo_path=checkout,
+        branch=branch,
+        work_dir=current.work_dir,
+        log_dir=current.log_dir,
+    )
+    inject_managed_env(config, state_dir)
+    return config
 
 
 def load_lan_task(

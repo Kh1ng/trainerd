@@ -376,10 +376,10 @@ def _pending_candidates(max_jobs: int) -> list[tuple[ProjectRuntime, dict]]:
     ]
 
 
-def _recover_stale_jobs(store: JobStore) -> None:
+def _recover_stale_jobs(runtime: ProjectRuntime) -> None:
     """On startup, mark any running jobs as failed (interrupted by shutdown)."""
-    for job_id in store.recover_interrupted_jobs():
-        status = store.get_job(job_id, "status")
+    for job_id in runtime.runner.recover_interrupted_jobs():
+        status = runtime.store.get_job(job_id, "status")
         log.warning("Recovered stale running job %s as %s", job_id, status)
 
 
@@ -504,7 +504,7 @@ async def _lifespan(app: FastAPI):
             _projects[configured.project] = runtime
         _validate_unique_job_ids(_projects)
         for runtime in _projects.values():
-            _recover_stale_jobs(runtime.store)
+            _recover_stale_jobs(runtime)
 
         default_runtime = _projects[_default_project]
         _config_path = default_runtime.config_path
@@ -645,9 +645,19 @@ async def submit_job(body: JobRequest = JobRequest()) -> dict:
     payload = body.model_dump(exclude_none=True)
     _validate_multi_project_request(payload)
     if _is_lan_mode():
-        runtime, payload = await _prepare_lan_runtime(payload)
+        lock = _lan_prepare_lock
+        if lock is None:
+            raise HTTPException(status_code=503, detail="LAN checkout manager is not initialized")
+        async with lock:
+            runtime, payload = await _prepare_lan_runtime(payload)
+            return _queue_job(runtime, payload)
     else:
         runtime = _select_runtime(payload.get("project"))
+    return _queue_job(runtime, payload)
+
+
+def _queue_job(runtime: ProjectRuntime, payload: dict[str, Any]) -> dict:
+    """Validate and persist one job against its selected runtime."""
     config = _refresh_project_runtime(runtime)
     store = runtime.store
     requested_steps = payload.get("steps")
@@ -665,6 +675,7 @@ async def submit_job(body: JobRequest = JobRequest()) -> dict:
     branch = payload.get("branch")
     markets = payload.get("markets")
     extra_args = payload.get("extra_args")
+    repo_sha = payload.get("repo_sha")
     force = payload.get("force", False)
 
     # Dedupe guard: reject duplicate pending/running jobs for same parameters
@@ -688,6 +699,7 @@ async def submit_job(body: JobRequest = JobRequest()) -> dict:
         branch=branch,
         markets=markets,
         extra_args=extra_args,
+        repo_sha=repo_sha,
         stage_queues={step.id: step.queue for step in config.steps if step.id in steps}
         if config.steps and all(step.queue for step in config.steps)
         else None,
@@ -738,37 +750,37 @@ async def _prepare_lan_runtime(
     if _lan_state_dir is None:
         raise HTTPException(status_code=503, detail="LAN state is not initialized")
 
-    lock = _lan_prepare_lock
-    if lock is None:
-        raise HTTPException(status_code=503, detail="LAN checkout manager is not initialized")
-    async with lock:
-        try:
-            normalized_repo = normalize_repo_url(selected_repo)
-            allowed_repos = _lan_allowed_repo_urls()
-            if allowed_repos and normalized_repo not in allowed_repos:
-                raise HTTPException(
-                    status_code=403,
-                    detail="Repository is not allowlisted on this trainerd host",
-                )
-            selected_key = repo_key(normalized_repo)
-            for existing_runtime in _projects.values():
-                if existing_runtime.lan_repo_key != selected_key:
-                    continue
-                if _lan_runtime_busy(existing_runtime):
-                    raise HTTPException(
-                        status_code=409,
-                        detail="This repository already has pending or running work",
-                    )
-            prepared = await asyncio.to_thread(
-                prepare_lan_project,
-                _lan_state_dir,
-                normalized_repo,
-                task,
-                branch=payload.get("branch"),
+    try:
+        normalized_repo = normalize_repo_url(selected_repo)
+        allowed_repos = _lan_allowed_repo_urls()
+        if allowed_repos and normalized_repo not in allowed_repos:
+            raise HTTPException(
+                status_code=403,
+                detail="Repository is not allowlisted on this trainerd host",
             )
-        except LanConfigError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        runtime = _install_lan_runtime(prepared)
+        selected_key = repo_key(normalized_repo)
+        existing = [
+            runtime
+            for runtime in _projects.values()
+            if runtime.lan_repo_key == selected_key
+        ]
+        if existing and sum(_lan_runtime_load(runtime) for runtime in existing) >= max(
+            runtime.config.max_concurrent_jobs for runtime in existing
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="This repository has reached its configured concurrent job limit",
+            )
+        prepared = await asyncio.to_thread(
+            prepare_lan_project,
+            _lan_state_dir,
+            normalized_repo,
+            task,
+            branch=payload.get("branch"),
+        )
+    except LanConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    runtime = _install_lan_runtime(prepared)
 
     sanitized = {
         key: value
@@ -776,19 +788,22 @@ async def _prepare_lan_runtime(
         if key in {"branch", "version", "steps", "force", "triggered_by"}
     }
     sanitized["project"] = runtime.project
+    sanitized["repo_sha"] = prepared.revision
     return runtime, sanitized
 
 
 def _install_lan_runtime(prepared: LanPreparedProject) -> ProjectRuntime:
     """Install or refresh a fully prepared dynamic runtime."""
-    for runtime in _projects.values():
-        if runtime.lan_repo_key != prepared.repo_key:
-            continue
-        if _lan_runtime_busy(runtime):
-            raise HTTPException(
-                status_code=409,
-                detail="This repository already has pending or running work",
-            )
+    repository_load = sum(
+        _lan_runtime_load(runtime)
+        for runtime in _projects.values()
+        if runtime.lan_repo_key == prepared.repo_key
+    )
+    if repository_load >= prepared.config.max_concurrent_jobs:
+        raise HTTPException(
+            status_code=409,
+            detail="This repository has reached its configured concurrent job limit",
+        )
 
     existing = _projects.get(prepared.project)
     if existing is not None:
@@ -797,7 +812,12 @@ def _install_lan_runtime(prepared: LanPreparedProject) -> ProjectRuntime:
         return existing
 
     store = JobStore(prepared.config.log_dir / "jobs.db")
-    runner = JobRunner(store, prepared.config, queues=_stage_queues)
+    runner = JobRunner(
+        store,
+        prepared.config,
+        queues=_stage_queues,
+        workspace_lock=_lan_prepare_lock,
+    )
     runtime = ProjectRuntime(
         prepared.project,
         None,
@@ -806,7 +826,12 @@ def _install_lan_runtime(prepared: LanPreparedProject) -> ProjectRuntime:
         runner,
         lan_repo_key=prepared.repo_key,
     )
-    _recover_stale_jobs(store)
+    _recover_stale_jobs(runtime)
+    if repository_load + _lan_runtime_load(runtime) >= prepared.config.max_concurrent_jobs:
+        raise HTTPException(
+            status_code=409,
+            detail="This repository has reached its configured concurrent job limit",
+        )
     for job_id in store.list_job_ids():
         found = _find_job_runtime(job_id)
         if found is not None:
@@ -822,11 +847,11 @@ def _install_lan_runtime(prepared: LanPreparedProject) -> ProjectRuntime:
     return runtime
 
 
-def _lan_runtime_busy(runtime: ProjectRuntime) -> bool:
-    """Keep checkout updates away from queued, running, and validating jobs."""
-    pending = runtime.store.list_job_ids(status=JobStatus.PENDING)
+def _lan_runtime_load(runtime: ProjectRuntime) -> int:
+    """Count repository slots held by queued, running, or validating jobs."""
+    pending = set(runtime.store.list_job_ids(status=JobStatus.PENDING))
     active = _active_job_ids_by_project({runtime.project: runtime})[runtime.project]
-    return bool(pending or active)
+    return len(pending | active)
 
 
 @app.get("/api/jobs", dependencies=[Depends(_read_api_key_auth)])
