@@ -196,7 +196,7 @@ class JobRunner:
                         async with self._queues.claim(queue):
                             self._store.set_running(job_id, step.id)
                             self._store.set_stage_running(job_id, step.id)
-                            started = time.monotonic()
+                            started = time.perf_counter()
                             ok = await _run_cmd(
                                 cmd,
                                 cwd=resolved_cwd,
@@ -206,7 +206,7 @@ class JobRunner:
                                 proc_store=self._running_procs,
                                 job_id=job_id,
                             )
-                            duration = time.monotonic() - started
+                            duration = time.perf_counter() - started
                     except asyncio.CancelledError:
                         if self._store.get_job(job_id, "stages")[step.id]["status"] == "running":
                             self._store.set_stage_failed(job_id, step.id, "Cancelled via API")

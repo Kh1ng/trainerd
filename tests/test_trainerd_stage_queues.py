@@ -47,7 +47,7 @@ def test_cpu_preparation_overlaps_gpu_without_concurrent_gpu_stages(
         job_id = env["TRAINERD_JOB_ID"]
         artifact_dirs[(job_id, cmd)] = env["TRAINERD_ARTIFACT_DIR"]
         occupancy.append(pool.snapshot())
-        start = time.monotonic()
+        start = time.perf_counter()
         if cmd == "train":
             gpu_running += 1
             max_gpu_running = max(max_gpu_running, gpu_running)
@@ -59,7 +59,7 @@ def test_cpu_preparation_overlaps_gpu_without_concurrent_gpu_stages(
         await asyncio.sleep(0.01)
         if cmd == "train":
             gpu_running -= 1
-        intervals[(job_id, cmd)] = (start, time.monotonic())
+        intervals[(job_id, cmd)] = (start, time.perf_counter())
         return True
 
     monkeypatch.setattr(runner_module, "_run_cmd", fake_run_cmd)
