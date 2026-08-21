@@ -18,13 +18,19 @@ class JobStatus:
 
 
 class JobStore:
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, read_only: bool = False) -> None:
         self._db = str(db_path)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init()
+        self._read_only_uri = f"{db_path.resolve().as_uri()}?mode=ro" if read_only else None
+        if not read_only:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._init()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db, check_same_thread=False)
+        conn = sqlite3.connect(
+            self._read_only_uri or self._db,
+            check_same_thread=False,
+            uri=self._read_only_uri is not None,
+        )
         conn.row_factory = sqlite3.Row
         return conn
 

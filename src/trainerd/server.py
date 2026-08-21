@@ -295,7 +295,7 @@ def _persisted_lan_stores() -> list[tuple[str, JobStore, Path]]:
     if not root.is_dir():
         return []
     return [
-        (path.name, JobStore(path / "jobs.db"), path)
+        (path.name, JobStore(path / "jobs.db", read_only=True), path)
         for path in root.iterdir()
         if path.is_dir()
         and (path / "jobs.db").is_file()
