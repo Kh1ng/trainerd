@@ -141,6 +141,10 @@ class JobRunner:
                     for k, v in (step.env or {}).items()
                 } if step.env else None
                 resolved_env = _with_repo_pythonpath(repo_path, resolved_env)
+                artifact_dir = (config.work_dir / job_id).resolve()
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                resolved_env["TRAINERD_JOB_ID"] = job_id
+                resolved_env["TRAINERD_ARTIFACT_DIR"] = str(artifact_dir)
                 if repo_sha:
                     resolved_env["TRAINERD_REPO_SHA"] = repo_sha
                 resolved_cwd = _resolve_template(step.cwd or "", version=version, repo_path=repo_path, work_dir=work_dir, extra_args=extra_args) or None

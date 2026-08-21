@@ -4,8 +4,8 @@
   "produced_at": "2026-07-03T06:00:00Z",
   "artifacts": [
     {
-      "path": "examples/work/demo-v1/result.json",
-      "sha256": "replace-me",
+      "path": "result.json",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
       "bytes": 72
     }
   ]
