@@ -649,7 +649,7 @@ async def _prepare_lan_runtime(
     payload: dict[str, Any],
 ) -> tuple[ProjectRuntime, dict[str, Any]]:
     """Resolve a bounded LAN request to a daemon-owned runtime."""
-    allowed = {"repo", "repo_url", "task", "version", "force", "triggered_by"}
+    allowed = {"repo", "repo_url", "task", "version", "steps", "force", "triggered_by"}
     unsupported = sorted(set(payload) - allowed)
     if unsupported:
         raise HTTPException(
@@ -706,7 +706,7 @@ async def _prepare_lan_runtime(
     sanitized = {
         key: value
         for key, value in payload.items()
-        if key in {"version", "force", "triggered_by"}
+        if key in {"version", "steps", "force", "triggered_by"}
     }
     sanitized["project"] = runtime.project
     return runtime, sanitized
