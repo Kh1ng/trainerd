@@ -39,6 +39,8 @@ def test_cpu_preparation_overlaps_gpu_without_concurrent_gpu_stages(
     occupancy: list[dict[str, dict[str, int | float]]] = []
     gpu_running = 0
     max_gpu_running = 0
+    first_gpu_started = asyncio.Event()
+    second_cpu_started = asyncio.Event()
 
     async def fake_run_cmd(cmd, cwd, logfile, env, timeout, **kwargs):
         nonlocal gpu_running, max_gpu_running
@@ -49,7 +51,12 @@ def test_cpu_preparation_overlaps_gpu_without_concurrent_gpu_stages(
         if cmd == "train":
             gpu_running += 1
             max_gpu_running = max(max_gpu_running, gpu_running)
-        await asyncio.sleep(0.05)
+        if (job_id, cmd) == ("job-a", "train"):
+            first_gpu_started.set()
+            await asyncio.wait_for(second_cpu_started.wait(), timeout=5)
+        if (job_id, cmd) == ("job-b", "prepare"):
+            second_cpu_started.set()
+        await asyncio.sleep(0.01)
         if cmd == "train":
             gpu_running -= 1
         intervals[(job_id, cmd)] = (start, time.monotonic())
@@ -59,7 +66,9 @@ def test_cpu_preparation_overlaps_gpu_without_concurrent_gpu_stages(
     runner = JobRunner(store, config, queues=pool)
 
     async def run_jobs() -> None:
-        await asyncio.gather(runner.run_job("job-a"), runner.run_job("job-b"))
+        first = asyncio.create_task(runner.run_job("job-a"))
+        await asyncio.wait_for(first_gpu_started.wait(), timeout=5)
+        await asyncio.gather(first, runner.run_job("job-b"))
 
     asyncio.run(run_jobs())
 
@@ -67,6 +76,7 @@ def test_cpu_preparation_overlaps_gpu_without_concurrent_gpu_stages(
     assert any(sample["cpu"]["occupancy"] == 1 for sample in occupancy)
     assert any(sample["gpu"]["occupancy"] == 1 for sample in occupancy)
     assert pool.snapshot()["gpu"]["occupancy"] == 0
+    assert second_cpu_started.is_set()
     assert any(
         cpu_start < gpu_end and gpu_start < cpu_end
         for cpu_job in ("job-a", "job-b")
