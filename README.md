@@ -221,6 +221,35 @@ Registry-mode requests must include `project`. They may select only configured
 step IDs. `branch` and arbitrary `extra_args` are rejected in registry mode;
 commands and paths remain entirely server-owned.
 
+## Job artifacts
+
+A repository-owned task can publish files from its managed work directory.
+trainerd exports `TRAINERD_JOB_ID` and `TRAINERD_ARTIFACT_DIR` to each task step.
+
+Write each file under `TRAINERD_ARTIFACT_DIR`. Then write
+`artifact_manifest.json` in the same directory:
+
+```json
+{
+  "run_label": "v42",
+  "job_id": "abcd1234",
+  "produced_at": "2026-08-21T12:00:00Z",
+  "artifacts": [
+    {
+      "path": "result.json",
+      "bytes": 72,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}
+```
+
+Artifact paths are relative to the job directory. trainerd rejects absolute
+paths, directory escapes, size mismatches, and SHA-256 mismatches.
+
+The manifest limit is 1 MiB and 256 entries. The total declared artifact size
+must not exceed 2 GiB. Artifact endpoints are unavailable without an API key.
+
 ## API
 
 | Endpoint | Authentication | Purpose |
@@ -230,6 +259,8 @@ commands and paths remain entirely server-owned.
 | `GET /api/jobs` | API key; none in LAN mode | List recent jobs |
 | `GET /api/jobs/{job_id}` | API key; none in LAN mode | Read job status |
 | `GET /api/jobs/{job_id}/logs` | API key; none in LAN mode | Tail or stream logs |
+| `GET /api/jobs/{job_id}/artifacts` | API key required | List validated job artifacts |
+| `GET /api/jobs/{job_id}/artifacts/{index}` | API key required | Download one validated artifact |
 | `DELETE /api/jobs/{job_id}` | API key; none in LAN mode | Cancel a queued/running job |
 | `POST /api/jobs/{job_id}/promote` | API key; none in LAN mode | Run a configured promotion hook |
 | `GET /api/models?project=...` | API key; none in LAN mode | Compatibility artifact listing |

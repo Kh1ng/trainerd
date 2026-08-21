@@ -13,7 +13,9 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
+import json
 import logging
 import os
 import re
@@ -26,12 +28,13 @@ from typing import Any
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, Security
-from fastapi.responses import PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.security import APIKeyHeader, APIKeyQuery
 from pydantic import BaseModel, ConfigDict, StrictBool, StrictStr
 
 from . import __version__
 from .config import ServerConfig, TrainingConfig, load_config, load_server_config
+from .contracts import ARTIFACT_MANIFEST_SCHEMA, validate_payload
 from .lan import (
     LanConfigError,
     LanPreparedProject,
@@ -76,6 +79,9 @@ _running_tasks: dict[str, asyncio.Task] = {}
 _queue_poll_interval: float = 5.0
 _LAN_API_KEY_ENV = "TRAINERD_API_KEY"
 _LAN_ALLOWED_REPOS_ENV = "TRAINERD_ALLOWED_REPOS"
+_MAX_ARTIFACT_MANIFEST_BYTES = 1024 * 1024
+_MAX_ARTIFACT_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_ARTIFACTS = 256
 
 
 class JobRequest(BaseModel):
@@ -101,22 +107,35 @@ _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 _api_key_query = APIKeyQuery(name="api_key", auto_error=False)
 
 
-def _api_key_auth(
-    header_key: str | None = Security(_api_key_header),
-    query_key: str | None = Security(_api_key_query),
-) -> None:
-    api_key = (
+def _configured_api_key() -> str:
+    return (
         os.environ.get(_LAN_API_KEY_ENV, "").strip()
         if _is_lan_mode()
         else _server_config.api_key
         if _server_config
         else (_config.api_key if _config else "")
     )
+
+
+def _api_key_auth(
+    header_key: str | None = Security(_api_key_header),
+    query_key: str | None = Security(_api_key_query),
+) -> None:
+    api_key = _configured_api_key()
     if not api_key:
         return
     key = header_key or query_key
     if key is None or not hmac.compare_digest(key, api_key):
         raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+def _required_api_key_auth(
+    header_key: str | None = Security(_api_key_header),
+    query_key: str | None = Security(_api_key_query),
+) -> None:
+    if not _configured_api_key():
+        raise HTTPException(status_code=503, detail="Artifact retrieval requires an API key")
+    _api_key_auth(header_key, query_key)
 
 
 def _read_api_key_auth(
@@ -554,13 +573,7 @@ async def health() -> dict:
         "running_jobs": running,
         "max_concurrent_jobs": max_jobs,
         "queue_capacity": max(max_jobs - active, 0),
-        "authentication_required": bool(
-            os.environ.get(_LAN_API_KEY_ENV, "").strip()
-            if _is_lan_mode()
-            else _server_config.api_key
-            if _server_config
-            else (_config.api_key if _config else "")
-        ),
+        "authentication_required": bool(_configured_api_key()),
         "allowed_repository_count": (
             len(_lan_allowed_repo_urls()) if _is_lan_mode() else None
         ),
@@ -649,7 +662,7 @@ async def _prepare_lan_runtime(
     payload: dict[str, Any],
 ) -> tuple[ProjectRuntime, dict[str, Any]]:
     """Resolve a bounded LAN request to a daemon-owned runtime."""
-    allowed = {"repo", "repo_url", "task", "branch", "version", "force", "triggered_by"}
+    allowed = {"repo", "repo_url", "task", "branch", "version", "steps", "force", "triggered_by"}
     unsupported = sorted(set(payload) - allowed)
     if unsupported:
         raise HTTPException(
@@ -707,7 +720,7 @@ async def _prepare_lan_runtime(
     sanitized = {
         key: value
         for key, value in payload.items()
-        if key in {"branch", "version", "force", "triggered_by"}
+        if key in {"branch", "version", "steps", "force", "triggered_by"}
     }
     sanitized["project"] = runtime.project
     return runtime, sanitized
@@ -830,6 +843,99 @@ async def stream_logs(job_id: str, request: Request, tail: int | None = None) ->
                         break
 
     return StreamingResponse(_generate(), media_type="text/plain")
+
+
+def _validated_job_artifacts(
+    runtime: ProjectRuntime,
+    job: dict,
+) -> tuple[dict[str, Any], list[Path]]:
+    job_root = (runtime.config.work_dir / job["job_id"]).resolve()
+    manifest_path = (job_root / "artifact_manifest.json").resolve()
+    if not manifest_path.is_relative_to(job_root):
+        raise HTTPException(status_code=422, detail="Artifact manifest has an invalid path")
+    try:
+        if manifest_path.stat().st_size > _MAX_ARTIFACT_MANIFEST_BYTES:
+            raise HTTPException(status_code=413, detail="Artifact manifest is too large")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Artifact manifest not found") from exc
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=422, detail="Artifact manifest could not be read") from exc
+
+    problems = validate_payload(manifest, ARTIFACT_MANIFEST_SCHEMA)
+    if problems:
+        raise HTTPException(status_code=422, detail="Invalid artifact manifest: " + "; ".join(problems))
+    if manifest.get("job_id") != job["job_id"] or manifest.get("run_label") != job["version"]:
+        raise HTTPException(status_code=422, detail="Artifact manifest does not match this job")
+    entries = manifest["artifacts"]
+    if len(entries) > _MAX_ARTIFACTS:
+        raise HTTPException(status_code=413, detail="Artifact manifest contains too many files")
+    declared_bytes = [entry.get("bytes") for entry in entries]
+    if any(type(size) is not int or size < 0 for size in declared_bytes):
+        raise HTTPException(status_code=422, detail="Artifact manifest has invalid byte counts")
+    if sum(declared_bytes) > _MAX_ARTIFACT_BYTES:
+        raise HTTPException(status_code=413, detail="Declared artifacts are too large")
+
+    paths: list[Path] = []
+    for index, entry in enumerate(entries):
+        try:
+            relative = Path(entry["path"])
+            path = (job_root / relative).resolve()
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=f"Artifact {index} has an invalid path") from exc
+        if relative.is_absolute() or not path.is_relative_to(job_root) or not path.is_file():
+            raise HTTPException(status_code=422, detail=f"Artifact {index} has an invalid path")
+        expected_bytes = entry.get("bytes")
+        expected_sha256 = entry.get("sha256")
+        if (
+            not isinstance(expected_sha256, str)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256) is None
+        ):
+            raise HTTPException(status_code=422, detail=f"Artifact {index} has invalid integrity metadata")
+        try:
+            if path.stat().st_size != expected_bytes:
+                raise HTTPException(status_code=422, detail=f"Artifact {index} size does not match its manifest")
+            digest = hashlib.sha256()
+            with path.open("rb") as artifact_file:
+                for chunk in iter(lambda: artifact_file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError as exc:
+            raise HTTPException(status_code=422, detail=f"Artifact {index} could not be read") from exc
+        if not hmac.compare_digest(digest.hexdigest(), expected_sha256.lower()):
+            raise HTTPException(status_code=422, detail=f"Artifact {index} hash does not match its manifest")
+        paths.append(path)
+    return manifest, paths
+
+
+@app.get("/api/jobs/{job_id}/artifacts", dependencies=[Depends(_required_api_key_auth)])
+async def list_job_artifacts(job_id: str) -> dict:
+    found = _find_job_runtime(job_id)
+    if not found:
+        raise HTTPException(status_code=404, detail="Job not found")
+    runtime, job = found
+    manifest, _ = await asyncio.to_thread(_validated_job_artifacts, runtime, job)
+    return {
+        **manifest,
+        "artifacts": [
+            {
+                **entry,
+                "download_url": f"/api/jobs/{job_id}/artifacts/{index}",
+            }
+            for index, entry in enumerate(manifest["artifacts"])
+        ],
+    }
+
+
+@app.get("/api/jobs/{job_id}/artifacts/{artifact_index}", dependencies=[Depends(_required_api_key_auth)])
+async def download_job_artifact(job_id: str, artifact_index: int) -> Response:
+    found = _find_job_runtime(job_id)
+    if not found:
+        raise HTTPException(status_code=404, detail="Job not found")
+    runtime, job = found
+    _, paths = await asyncio.to_thread(_validated_job_artifacts, runtime, job)
+    if artifact_index < 0 or artifact_index >= len(paths):
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    return FileResponse(paths[artifact_index], filename=paths[artifact_index].name)
 
 
 @app.delete("/api/jobs/{job_id}", dependencies=[Depends(_api_key_auth)])

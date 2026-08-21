@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 import trainerd.server as server
 from trainerd.cli import main as trainerd_main
+from trainerd.config import StepConfig
 from trainerd.lan import (
     LanConfigError,
     LanPreparedProject,
@@ -275,6 +276,7 @@ def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
     monkeypatch.delenv("TRAINERD_API_KEY", raising=False)
     monkeypatch.delenv("TRAINERD_ALLOWED_REPOS", raising=False)
     prepared = _prepared(tmp_path)
+    prepared.config.steps.append(StepConfig("evaluate", "Evaluate", "evaluate"))
     old_state = (
         server._server_config,
         server._projects,
@@ -309,6 +311,7 @@ def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
                     "repo": "http://git.local/team/repo.git",
                     "task": "nfl-train",
                     "branch": "feature/mod4",
+                    "steps": ["train"],
                 },
             )
 

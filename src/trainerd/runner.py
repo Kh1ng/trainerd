@@ -6,6 +6,7 @@ and optionally promotes model artifacts back to the git repo.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import fnmatch
 import json
 import logging
@@ -140,6 +141,10 @@ class JobRunner:
                     for k, v in (step.env or {}).items()
                 } if step.env else None
                 resolved_env = _with_repo_pythonpath(repo_path, resolved_env)
+                artifact_dir = (config.work_dir / job_id).resolve()
+                artifact_dir.mkdir(parents=True, exist_ok=True)
+                resolved_env["TRAINERD_JOB_ID"] = job_id
+                resolved_env["TRAINERD_ARTIFACT_DIR"] = str(artifact_dir)
                 if repo_sha:
                     resolved_env["TRAINERD_REPO_SHA"] = repo_sha
                 resolved_cwd = _resolve_template(step.cwd or "", version=version, repo_path=repo_path, work_dir=work_dir, extra_args=extra_args) or None
@@ -386,10 +391,12 @@ async def _run_cmd(
             proc_store[job_id] = proc
         try:
             async def _drain_stdout() -> None:
-                async for line in proc.stdout:  # type: ignore[union-attr]
-                    decoded = line.decode("utf-8", errors="replace").rstrip()
-                    logfile.write(decoded + "\n")
+                decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                while chunk := await proc.stdout.read(64 * 1024):  # type: ignore[union-attr]
+                    logfile.write(decoder.decode(chunk))
                     logfile.flush()
+                logfile.write(decoder.decode(b"", final=True))
+                logfile.flush()
 
             await asyncio.wait_for(_drain_stdout(), timeout=timeout)
         except asyncio.TimeoutError:

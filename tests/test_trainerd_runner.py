@@ -1,6 +1,7 @@
 """Unit tests for trainerd runner template resolution."""
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 import subprocess
@@ -33,8 +34,9 @@ except ImportError:
             except Exception:
                 sys.path.insert(0, str(_ROOT.parent))
 
-from trainerd.config import RepoConfig
-from trainerd.runner import RepoSyncError, _resolve_template, _sync_repo_checkout, _with_repo_pythonpath
+from trainerd.config import RepoConfig, StepConfig, TrainingConfig
+from trainerd.runner import JobRunner, RepoSyncError, _resolve_template, _sync_repo_checkout, _with_repo_pythonpath
+from trainerd.storage import JobStore
 
 
 def test_resolve_markets_flag_populated() -> None:
@@ -117,6 +119,37 @@ def test_with_repo_pythonpath_dedupes_repo_path() -> None:
     existing = os.pathsep.join(["/repo", "/other"])
     env = _with_repo_pythonpath("/repo", {"PYTHONPATH": existing})
     assert env["PYTHONPATH"] == existing
+
+
+def test_runner_exports_managed_artifact_location(tmp_path: Path, monkeypatch) -> None:
+    import trainerd.runner as runner_module
+
+    config = TrainingConfig(
+        project="test",
+        repo=RepoConfig("", "main", str(tmp_path / "repo")),
+        work_dir=tmp_path / "work",
+        steps=[StepConfig("run", "Run", "run")],
+        validation=None,
+        promotion=None,
+        api_key="",
+        server_port=7860,
+        log_dir=tmp_path / "logs",
+    )
+    config.log_dir.mkdir()
+    store = JobStore(tmp_path / "jobs.db")
+    store.create_job("job-123", steps=["run"], version="v1")
+    captured: dict[str, str] = {}
+
+    async def fake_run_cmd(cmd, cwd, logfile, env, timeout, **kwargs):
+        captured.update(env)
+        return True
+
+    monkeypatch.setattr(runner_module, "_run_cmd", fake_run_cmd)
+    asyncio.run(JobRunner(store, config).run_job("job-123"))
+
+    assert captured["TRAINERD_JOB_ID"] == "job-123"
+    assert captured["TRAINERD_ARTIFACT_DIR"] == str((config.work_dir / "job-123").resolve())
+    assert Path(captured["TRAINERD_ARTIFACT_DIR"]).is_dir()
 
 
 def _git(repo: Path, *args: str) -> str:

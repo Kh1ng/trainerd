@@ -36,7 +36,7 @@ JOB_PAYLOAD_SCHEMA: dict[str, Any] = {
 
 ARTIFACT_MANIFEST_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "required": ["run_label", "produced_at", "artifacts"],
+    "required": ["run_label", "job_id", "produced_at", "artifacts"],
     "properties": {
         "run_label": {"type": "string"},
         "job_id": {"type": "string"},
@@ -48,7 +48,7 @@ ARTIFACT_MANIFEST_SCHEMA: dict[str, Any] = {
             "type": "array",
             "items": {
                 "type": "object",
-                "required": ["path"],
+                "required": ["path", "sha256", "bytes"],
                 "properties": {
                     "path": {"type": "string"},
                     "sha256": {"type": "string"},

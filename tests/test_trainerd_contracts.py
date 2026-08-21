@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import hashlib
+import json
 from pathlib import Path
 
 import yaml
@@ -129,6 +131,62 @@ def test_trainerd_submit_status_logs_and_cancel_contract(tmp_path: Path) -> None
         after = client.get(f"/api/jobs/{job_id}")
         assert after.status_code == 200
         assert after.json()["status"] == "failed"
+    finally:
+        client.close()
+        _restore_trainerd_server(old_state)
+
+
+def test_job_artifacts_are_authenticated_and_integrity_checked(tmp_path: Path) -> None:
+    client, old_state = _configure_trainerd_server(tmp_path)
+    try:
+        work_dir = tmp_path / "work"
+        job_id = "job-123"
+        job_dir = work_dir / job_id
+        job_dir.mkdir(parents=True)
+        artifact = job_dir / "result.json"
+        artifact.write_bytes(b'{"status":"ok"}\n')
+        server_mod._config.work_dir = work_dir
+        server_mod._store.create_job(job_id, steps=["train"], version="v9")
+        server_mod._store.set_completed(job_id)
+
+        manifest = {
+            "run_label": "v9",
+            "job_id": job_id,
+            "produced_at": "2026-08-21T12:00:00Z",
+            "artifacts": [
+                {
+                    "path": "result.json",
+                    "bytes": artifact.stat().st_size,
+                    "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                }
+            ],
+        }
+        manifest_path = job_dir / "artifact_manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        assert client.get(f"/api/jobs/{job_id}/artifacts").status_code == 503
+        server_mod._config.api_key = "secret"
+        assert client.get(f"/api/jobs/{job_id}/artifacts").status_code == 401
+        headers = {"X-API-Key": "secret"}
+        listed = client.get(f"/api/jobs/{job_id}/artifacts", headers=headers)
+        assert listed.status_code == 200
+        assert listed.json()["artifacts"][0]["download_url"].endswith("/artifacts/0")
+        downloaded = client.get(f"/api/jobs/{job_id}/artifacts/0", headers=headers)
+        assert downloaded.status_code == 200
+        assert downloaded.content == artifact.read_bytes()
+
+        artifact.write_bytes(b"tampered")
+        assert client.get(f"/api/jobs/{job_id}/artifacts/0", headers=headers).status_code == 422
+
+        outside = work_dir / "outside.bin"
+        outside.write_bytes(b"outside")
+        manifest["artifacts"][0] = {
+            "path": "../outside.bin",
+            "bytes": outside.stat().st_size,
+            "sha256": hashlib.sha256(outside.read_bytes()).hexdigest(),
+        }
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        assert client.get(f"/api/jobs/{job_id}/artifacts", headers=headers).status_code == 422
     finally:
         client.close()
         _restore_trainerd_server(old_state)
