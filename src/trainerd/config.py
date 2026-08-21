@@ -29,6 +29,7 @@ class StepConfig:
     cwd: str | None = None
     env: dict[str, str] = field(default_factory=dict)
     timeout_seconds: int = 7200  # 2 hours default
+    queue: str | None = None
 
 
 @dataclass
@@ -144,9 +145,11 @@ def load_config(path: Path) -> TrainingConfig:
             cwd=_resolve(s.get("cwd", repo.local_path), work_dir, repo.local_path),
             env={k: _resolve(v, work_dir, repo.local_path) for k, v in s.get("env", {}).items()},
             timeout_seconds=s.get("timeout_seconds", 7200),
+            queue=s.get("queue"),
         )
         for s in raw.get("steps", [])
     ]
+    _validate_step_queues(steps)
 
     val_raw = raw.get("validation")
     validation = None
@@ -187,6 +190,15 @@ def load_config(path: Path) -> TrainingConfig:
         log_dir=log_dir,
         max_concurrent_jobs=int(raw.get("max_concurrent_jobs", 1)),
     )
+
+
+def _validate_step_queues(steps: list[StepConfig]) -> None:
+    queues = [step.queue for step in steps]
+    if any(queues) and not all(queues):
+        raise ValueError("Every step must set queue when stage queues are used")
+    invalid = sorted({queue for queue in queues if queue not in (None, "cpu", "gpu")})
+    if invalid:
+        raise ValueError(f"Unsupported step queue(s): {', '.join(invalid)}")
 
 
 def _manifest_path(value: Any, manifest_path: Path) -> Path:

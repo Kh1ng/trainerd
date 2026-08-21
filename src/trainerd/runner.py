@@ -15,6 +15,8 @@ import signal
 import shutil
 import subprocess
 import tempfile
+import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,6 +30,40 @@ class RepoSyncError(RuntimeError):
     """The configured checkout could not be safely updated."""
 
 
+class StageQueuePool:
+    """Daemon-shared bounded admission for CPU and GPU stages."""
+
+    def __init__(self, *, cpu: int = 1, gpu: int = 1) -> None:
+        if not 1 <= cpu <= 64:
+            raise ValueError("CPU stage queue limit must be from 1 to 64")
+        if gpu != 1:
+            raise ValueError("The GPU stage queue limit must be 1 for the configured GPU")
+        self._limits = {"cpu": cpu, "gpu": gpu}
+        self._semaphores = {name: asyncio.Semaphore(limit) for name, limit in self._limits.items()}
+        self._running = {"cpu": 0, "gpu": 0}
+
+    @asynccontextmanager
+    async def claim(self, queue: str):
+        semaphore = self._semaphores[queue]
+        await semaphore.acquire()
+        self._running[queue] += 1
+        try:
+            yield
+        finally:
+            self._running[queue] -= 1
+            semaphore.release()
+
+    def snapshot(self) -> dict[str, dict[str, int | float]]:
+        return {
+            name: {
+                "running": self._running[name],
+                "limit": limit,
+                "occupancy": self._running[name] / limit,
+            }
+            for name, limit in self._limits.items()
+        }
+
+
 class JobRunner:
     def __init__(
         self,
@@ -35,10 +71,12 @@ class JobRunner:
         config: TrainingConfig,
         *,
         config_path: Path | None = None,
+        queues: StageQueuePool | None = None,
     ) -> None:
         self._store = store
         self._config = config
         self._config_path = config_path
+        self._queues = queues or StageQueuePool()
         # TrainingConfig always has project. getattr preserves lightweight
         # test/embedding stubs that only exercise promotion helpers.
         self._project = getattr(config, "project", None)
@@ -123,7 +161,6 @@ class JobRunner:
                     self._store.set_failed(job_id, f"Step '{step_id}' missing from current config")
                     _log(f"FAILED: step '{step_id}' no longer exists in {self._config_path or 'active config'}")
                     return
-                self._store.set_running(job_id, step.id)
                 _log(f"--- Step: {step.name} ---")
                 repo_path = str(config.repo.local_path)
                 work_dir = str(config.work_dir)
@@ -149,13 +186,50 @@ class JobRunner:
                     resolved_env["TRAINERD_REPO_SHA"] = repo_sha
                 resolved_cwd = _resolve_template(step.cwd or "", version=version, repo_path=repo_path, work_dir=work_dir, extra_args=extra_args) or None
                 _log(f"cmd: {cmd}")
-                ok = await _run_cmd(cmd, cwd=resolved_cwd, logfile=logfile, env=resolved_env, timeout=step.timeout_seconds,
-                                    proc_store=self._running_procs, job_id=job_id)
+                prior = (self._store.get_job(job_id, "stages") or {}).get(step.id, {})
+                queue = prior.get("queue")
+                if queue:
+                    if prior.get("status") == "completed":
+                        _log(f"--- Step already completed before restart: {step.name} ---")
+                        continue
+                    try:
+                        async with self._queues.claim(queue):
+                            self._store.set_running(job_id, step.id)
+                            self._store.set_stage_running(job_id, step.id)
+                            started = time.monotonic()
+                            ok = await _run_cmd(
+                                cmd,
+                                cwd=resolved_cwd,
+                                logfile=logfile,
+                                env=resolved_env,
+                                timeout=step.timeout_seconds,
+                                proc_store=self._running_procs,
+                                job_id=job_id,
+                            )
+                            duration = time.monotonic() - started
+                    except asyncio.CancelledError:
+                        if self._store.get_job(job_id, "stages")[step.id]["status"] == "running":
+                            self._store.set_stage_failed(job_id, step.id, "Cancelled via API")
+                        raise
+                else:
+                    self._store.set_running(job_id, step.id)
+                    ok = await _run_cmd(
+                        cmd,
+                        cwd=resolved_cwd,
+                        logfile=logfile,
+                        env=resolved_env,
+                        timeout=step.timeout_seconds,
+                        proc_store=self._running_procs,
+                        job_id=job_id,
+                    )
                 self._running_procs.pop(job_id, None)
                 if not ok:
+                    self._store.set_stage_failed(job_id, step.id, "Step failed")
                     self._store.set_failed(job_id, f"Step '{step.id}' failed — see job log")
                     _log(f"FAILED at step: {step.id}")
                     return
+                if queue:
+                    self._store.set_stage_completed(job_id, step.id, duration)
 
             should_validate_and_promote = "train" in step_ids
             if not should_validate_and_promote:

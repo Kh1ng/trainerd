@@ -130,6 +130,29 @@ def test_lan_manifest_resolves_managed_paths(tmp_path: Path) -> None:
     assert config.promotion is None
 
 
+def test_lan_manifest_loads_explicit_stage_queues(tmp_path: Path) -> None:
+    manifest = _write_manifest(tmp_path)
+    raw = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+    raw["tasks"]["nfl-train"]["steps"] = [
+        {"id": "prepare", "cmd": "prepare", "queue": "cpu"},
+        {"id": "train", "cmd": "train", "queue": "gpu"},
+    ]
+    manifest.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    config = load_lan_task(
+        manifest,
+        task="nfl-train",
+        project="test",
+        repo_url="http://git.local/team/repo.git",
+        repo_path=tmp_path,
+        branch="main",
+        work_dir=tmp_path / "work",
+        log_dir=tmp_path / "logs",
+    )
+
+    assert [step.queue for step in config.steps] == ["cpu", "gpu"]
+
+
 def test_lan_manifest_rejects_cwd_escape_and_unknown_fields(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -232,6 +255,7 @@ def test_cli_lan_mode_has_zero_config_listener_defaults() -> None:
         lan=True,
         state_dir=None,
         max_concurrent_jobs=None,
+        cpu_concurrency=None,
         allowed_repos=None,
     )
 

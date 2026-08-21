@@ -43,7 +43,7 @@ from .lan import (
     prepare_lan_project,
     repo_key,
 )
-from .runner import JobRunner
+from .runner import JobRunner, StageQueuePool
 from .storage import JobStore, JobStatus
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -72,6 +72,7 @@ _lan_mode_active = False
 _lan_state_dir: Path | None = None
 _lan_max_concurrent_jobs = 1
 _lan_prepare_lock: asyncio.Lock | None = None
+_stage_queues: StageQueuePool | None = None
 
 # Queue worker state
 _queue_worker_task: asyncio.Task | None = None
@@ -377,9 +378,9 @@ def _pending_candidates(max_jobs: int) -> list[tuple[ProjectRuntime, dict]]:
 
 def _recover_stale_jobs(store: JobStore) -> None:
     """On startup, mark any running jobs as failed (interrupted by shutdown)."""
-    for job_id in store.list_job_ids(status=JobStatus.RUNNING):
-        log.warning("Recovering stale running job %s — marking as failed (interrupted)", job_id)
-        store.set_failed(job_id, "Interrupted — server restarted")
+    for job_id in store.recover_interrupted_jobs():
+        status = store.get_job(job_id, "status")
+        log.warning("Recovered stale running job %s as %s", job_id, status)
 
 
 async def _queue_worker() -> None:
@@ -428,7 +429,14 @@ async def _run_job_wrapper(job_id: str, project: str | None = None) -> None:
         log.info("Job %s was cancelled", job_id)
         job = runtime.store.get_job(job_id)
         if job and job["status"] in (JobStatus.PENDING, JobStatus.RUNNING):
-            runtime.store.set_failed(job_id, "Cancelled via API")
+            stages = job.get("stages") or {}
+            if stages and not any(
+                stage.get("status") in {"running", "failed"}
+                for stage in stages.values()
+            ):
+                runtime.store.set_pending(job_id)
+            else:
+                runtime.store.set_failed(job_id, "Cancelled via API")
     except Exception:
         log.exception("Unexpected error in job %s", job_id)
         runtime.store.set_failed(job_id, "Internal error — see server logs")
@@ -442,6 +450,12 @@ async def _lifespan(app: FastAPI):
     global _store, _runner, _config, _config_path, _queue_worker_task
     global _server_config, _projects, _default_project
     global _lan_mode_active, _lan_state_dir, _lan_max_concurrent_jobs, _lan_prepare_lock
+    global _stage_queues
+    try:
+        cpu_limit = int(os.environ.get("TRAINERD_CPU_CONCURRENCY", "1"))
+    except ValueError as exc:
+        raise ValueError("TRAINERD_CPU_CONCURRENCY must be an integer") from exc
+    _stage_queues = StageQueuePool(cpu=cpu_limit, gpu=1)
     _lan_mode_active = os.environ.get("TRAINERD_LAN_MODE") == "1"
     _projects = {}
     allowed_repos: frozenset[str] = frozenset()
@@ -474,7 +488,12 @@ async def _lifespan(app: FastAPI):
         _default_project = _server_config.default_project
         for configured in _server_config.projects.values():
             store = JobStore(configured.config.log_dir / "jobs.db")
-            runner = JobRunner(store, configured.config, config_path=configured.config_path)
+            runner = JobRunner(
+                store,
+                configured.config,
+                config_path=configured.config_path,
+                queues=_stage_queues,
+            )
             runtime = ProjectRuntime(
                 configured.project,
                 configured.config_path,
@@ -524,8 +543,14 @@ async def _lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
     # Cancel any running training tasks
-    for jid, task in list(_running_tasks.items()):
+    tasks = list(_running_tasks.items())
+    for jid, task in tasks:
+        found = _find_job_runtime(jid)
+        if found:
+            await found[0].runner.cancel_job(jid)
         task.cancel()
+    if tasks:
+        await asyncio.gather(*(task for _, task in tasks), return_exceptions=True)
     _running_tasks.clear()
     app.state.queue_wake = None
     _projects = {}
@@ -534,6 +559,7 @@ async def _lifespan(app: FastAPI):
     _lan_mode_active = False
     _lan_state_dir = None
     _lan_prepare_lock = None
+    _stage_queues = None
 
 
 app = FastAPI(title="trainerd", version=__version__, lifespan=_lifespan)
@@ -595,6 +621,7 @@ async def health() -> dict:
         "running_jobs": running,
         "max_concurrent_jobs": max_jobs,
         "queue_capacity": max(max_jobs - active, 0),
+        "stage_queues": _stage_queues.snapshot() if _stage_queues else None,
         "authentication_required": bool(_configured_api_key()),
         "allowed_repository_count": (
             len(_lan_allowed_repo_urls()) if _is_lan_mode() else None
@@ -661,6 +688,9 @@ async def submit_job(body: JobRequest = JobRequest()) -> dict:
         branch=branch,
         markets=markets,
         extra_args=extra_args,
+        stage_queues={step.id: step.queue for step in config.steps if step.id in steps}
+        if config.steps and all(step.queue for step in config.steps)
+        else None,
     )
     _wake_queue()
     log.info(
@@ -767,7 +797,7 @@ def _install_lan_runtime(prepared: LanPreparedProject) -> ProjectRuntime:
         return existing
 
     store = JobStore(prepared.config.log_dir / "jobs.db")
-    runner = JobRunner(store, prepared.config)
+    runner = JobRunner(store, prepared.config, queues=_stage_queues)
     runtime = ProjectRuntime(
         prepared.project,
         None,
@@ -1072,6 +1102,7 @@ def main(
     lan: bool = False,
     state_dir: str | None = None,
     max_concurrent_jobs: int | None = None,
+    cpu_concurrency: int | None = None,
     allowed_repos: list[str] | None = None,
 ) -> None:
     if not lan and (
@@ -1084,6 +1115,10 @@ def main(
         )
     if not lan:
         os.environ.pop(_LAN_ALLOWED_REPOS_ENV, None)
+    if cpu_concurrency is not None:
+        if not 1 <= cpu_concurrency <= 64:
+            raise ValueError("--cpu-concurrency must be from 1 to 64")
+        os.environ["TRAINERD_CPU_CONCURRENCY"] = str(cpu_concurrency)
     if lan:
         os.environ["TRAINERD_LAN_MODE"] = "1"
         os.environ.pop("TRAINERD_PROJECTS_CONFIG", None)

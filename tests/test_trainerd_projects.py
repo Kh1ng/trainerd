@@ -491,5 +491,6 @@ def test_cli_serve_passes_explicit_registry_and_listener() -> None:
         lan=False,
         state_dir=None,
         max_concurrent_jobs=None,
+        cpu_concurrency=None,
         allowed_repos=None,
     )

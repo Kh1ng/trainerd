@@ -92,10 +92,17 @@ tasks:
   nfl-train:
     required_env:
       - NFL_DATABASE_URL
-    max_concurrent_jobs: 1
+    # Set this to at least 2 to overlap stages from independent jobs.
+    max_concurrent_jobs: 2
     steps:
+      - id: prepare
+        name: Prepare training data
+        queue: cpu
+        cmd: 'py -3.12 -u scripts/prepare.py --work-dir "{work_dir}"'
+        cwd: "."
       - id: train
         name: Train NFL models
+        queue: gpu
         cmd: 'py -3.12 -u scripts/trainerd_nfl_task.py --work-dir "{work_dir}"'
         cwd: "."
         timeout_seconds: 14400
@@ -124,6 +131,13 @@ executable code from the repository.
 LAN mode runs at most one queued, running, or validating job per repository so
 that checkout updates cannot race repository-owned commands. The daemon-wide
 concurrency setting applies across different repositories.
+
+When every task step sets `queue: cpu` or `queue: gpu`, trainerd persists each
+stage handoff and admits it through a daemon-wide queue. The GPU queue is fixed
+at one stage for the configured GPU. Set CPU capacity with
+`--cpu-concurrency`; set `--max-concurrent-jobs 1` to disable overlap. Job
+status includes stage wait/duration metrics, and `/api/health` reports live
+queue occupancy. Stages in one job share `TRAINERD_ARTIFACT_DIR`.
 
 Immediately before a LAN job starts, trainerd verifies that the managed
 checkout has no tracked changes and fast-forwards it to its configured remote

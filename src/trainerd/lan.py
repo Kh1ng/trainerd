@@ -266,7 +266,11 @@ def load_lan_task(
         label = f"task {task!r} step {index}"
         if not isinstance(value, dict):
             raise LanConfigError(f"{label} must be a mapping")
-        _only_keys(value, {"id", "name", "cmd", "cwd", "env", "timeout_seconds"}, label)
+        _only_keys(
+            value,
+            {"id", "name", "cmd", "cwd", "env", "timeout_seconds", "queue"},
+            label,
+        )
         step_id = _safe_id(value.get("id"), f"{label} id")
         if step_id in seen_steps:
             raise LanConfigError(f"Duplicate step id: {step_id}")
@@ -276,7 +280,13 @@ def load_lan_task(
         cwd = _safe_cwd(value.get("cwd", "."), repo_root, work_root, label)
         env = _safe_env(value.get("env", {}), label)
         timeout = _bounded_int(value.get("timeout_seconds", 7200), 1, 604800, f"{label} timeout_seconds")
-        steps.append(StepConfig(step_id, name, cmd, cwd, env, timeout))
+        queue = value.get("queue")
+        if queue not in (None, "cpu", "gpu"):
+            raise LanConfigError(f"{label} queue must be cpu or gpu")
+        steps.append(StepConfig(step_id, name, cmd, cwd, env, timeout, queue))
+
+    if any(step.queue for step in steps) and not all(step.queue for step in steps):
+        raise LanConfigError(f"task {task!r} must assign every step to a queue")
 
     validation = _load_validation(task_raw.get("validation"), repo_root, work_root, task)
     max_jobs = _bounded_int(
