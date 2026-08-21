@@ -54,6 +54,14 @@ class JobStore:
                     conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ctype}")
                 except Exception:
                     pass
+            conn.execute("CREATE INDEX IF NOT EXISTS jobs_created_at ON jobs(created_at)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_status_created_at ON jobs(status, created_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS jobs_version_status_created_at "
+                "ON jobs(version, status, created_at)"
+            )
 
     def create_job(
         self,

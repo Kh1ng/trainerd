@@ -383,7 +383,7 @@ def _recover_stale_jobs(store: JobStore) -> None:
 
 
 async def _queue_worker() -> None:
-    """Poll all allowlisted queues without exceeding the daemon-wide cap."""
+    """Dispatch queued jobs within daemon-wide and per-project limits."""
     max_jobs = (
         _lan_max_concurrent_jobs
         if _is_lan_mode()
@@ -396,7 +396,7 @@ async def _queue_worker() -> None:
         try:
             runtimes = _runtime_map()
             if not runtimes:
-                await asyncio.sleep(1)
+                await _wait_for_queue()
                 continue
             for runtime in runtimes.values():
                 _refresh_project_runtime(runtime)
@@ -408,9 +408,8 @@ async def _queue_worker() -> None:
                 log.info("Queue worker claiming job %s for project %s", jid, runtime.project)
                 task = asyncio.create_task(_run_job_wrapper(jid, runtime.project))
                 _running_tasks[jid] = task
-                task.add_done_callback(lambda t, jid=jid: _running_tasks.pop(jid, None))
 
-            await asyncio.sleep(_queue_poll_interval)
+            await _wait_for_queue()
         except asyncio.CancelledError:
             log.info("Queue worker cancelled")
             break
@@ -433,6 +432,9 @@ async def _run_job_wrapper(job_id: str, project: str | None = None) -> None:
     except Exception:
         log.exception("Unexpected error in job %s", job_id)
         runtime.store.set_failed(job_id, "Internal error — see server logs")
+    finally:
+        _running_tasks.pop(job_id, None)
+        _wake_queue()
 
 
 @asynccontextmanager
@@ -491,7 +493,7 @@ async def _lifespan(app: FastAPI):
         _store = default_runtime.store
         _runner = default_runtime.runner
 
-    # Start background queue worker
+    app.state.queue_wake = asyncio.Event()
     _queue_worker_task = asyncio.create_task(_queue_worker())
 
     if _lan_mode_active and not allowed_repos:
@@ -525,6 +527,7 @@ async def _lifespan(app: FastAPI):
     for jid, task in list(_running_tasks.items()):
         task.cancel()
     _running_tasks.clear()
+    app.state.queue_wake = None
     _projects = {}
     _server_config = None
     _default_project = None
@@ -534,6 +537,25 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(title="trainerd", version=__version__, lifespan=_lifespan)
+
+
+def _wake_queue() -> None:
+    """Notify the scheduler that pending work or available capacity changed."""
+    wake = getattr(app.state, "queue_wake", None)
+    if wake is not None:
+        wake.set()
+
+
+async def _wait_for_queue() -> None:
+    wake = getattr(app.state, "queue_wake", None)
+    if wake is None:
+        await asyncio.sleep(_queue_poll_interval)
+        return
+    try:
+        await asyncio.wait_for(wake.wait(), timeout=_queue_poll_interval)
+    except asyncio.TimeoutError:
+        pass
+    wake.clear()
 
 
 def _refresh_runtime_config() -> TrainingConfig:
@@ -640,6 +662,7 @@ async def submit_job(body: JobRequest = JobRequest()) -> dict:
         markets=markets,
         extra_args=extra_args,
     )
+    _wake_queue()
     log.info(
         "Job %s queued: project=%s steps=%s version=%s force=%s",
         job_id,
@@ -959,6 +982,7 @@ async def cancel_job(job_id: str) -> dict:
         if task is not None:
             task.cancel()
         runtime.store.set_failed(job_id, "Cancelled via API")
+        _wake_queue()
         log.info("Pending job %s cancelled", job_id)
         return {
             "job_id": job_id,
