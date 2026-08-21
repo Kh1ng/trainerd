@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
+import stat
 from pathlib import Path
 from unittest.mock import patch
 
@@ -425,6 +427,54 @@ def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
             server._lan_state_dir,
             server._lan_prepare_lock,
             server._running_tasks,
+        ) = old_state
+
+
+def test_lan_lists_historical_jobs_from_read_only_database(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    job_dir = state_dir / "jobs" / "historical-project"
+    store = JobStore(job_dir / "jobs.db")
+    store.create_job("historical-job", ["train"], "v1")
+    database = job_dir / "jobs.db"
+    with sqlite3.connect(database) as conn:
+        conn.execute("DROP INDEX jobs_created_at")
+        conn.execute("DROP INDEX jobs_status_created_at")
+        conn.execute("DROP INDEX jobs_version_status_created_at")
+    database.chmod(stat.S_IREAD)
+    old_state = (
+        server._projects,
+        server._store,
+        server._runner,
+        server._config,
+        server._config_path,
+        server._lan_mode_active,
+        server._lan_state_dir,
+    )
+    server._projects = {}
+    server._store = None
+    server._runner = None
+    server._config = None
+    server._config_path = None
+    server._lan_mode_active = True
+    server._lan_state_dir = state_dir
+
+    client = TestClient(server.app)
+    try:
+        response = client.get("/api/jobs?limit=1")
+
+        assert response.status_code == 200
+        assert response.json()[0]["job_id"] == "historical-job"
+    finally:
+        client.close()
+        database.chmod(stat.S_IWRITE | stat.S_IREAD)
+        (
+            server._projects,
+            server._store,
+            server._runner,
+            server._config,
+            server._config_path,
+            server._lan_mode_active,
+            server._lan_state_dir,
         ) = old_state
 
 
