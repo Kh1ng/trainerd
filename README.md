@@ -341,11 +341,12 @@ alternate port, then switches the service action; the old environment remains
 available for rollback.
 
 Upgrade the running daemon atomically with the bundled helper. It refuses to
-cut over while the queue has pending or running jobs, installs the candidate
-into a new versioned environment, probes it on an alternate port with an
-isolated LAN state directory, stops only the `trainerd-lan` task, switches the
-task action, and verifies health and version. If the switch or verification
-fails, it restores the prior action and rechecks health:
+cut over while the queue has pending or running jobs, rechecks the queue
+immediately before the cutover, installs the candidate into a fresh versioned
+environment, probes it on an alternate port with a unique isolated LAN state
+directory, stops only the `trainerd-lan` task, switches the task action, and
+verifies health and version. If the switch or verification fails, it restores
+the prior action and rechecks health against the prior version:
 
 ```powershell
 .\scripts\trainerd-upgrade.ps1 -Version 0.3.13 `
