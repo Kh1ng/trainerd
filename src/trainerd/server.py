@@ -180,6 +180,15 @@ def _is_lan_mode() -> bool:
     return _lan_mode_active
 
 
+def _daemon_max_concurrent_jobs() -> int:
+    """Daemon-wide concurrency limit for the current mode."""
+    if _is_lan_mode():
+        return _lan_max_concurrent_jobs
+    if _server_config:
+        return _server_config.max_concurrent_jobs
+    return _config.max_concurrent_jobs if _config else 1
+
+
 def _lan_allowed_repo_urls() -> frozenset[str]:
     values = [
         value.strip()
@@ -385,13 +394,7 @@ def _recover_stale_jobs(runtime: ProjectRuntime) -> None:
 
 async def _queue_worker() -> None:
     """Dispatch queued jobs within daemon-wide and per-project limits."""
-    max_jobs = (
-        _lan_max_concurrent_jobs
-        if _is_lan_mode()
-        else _server_config.max_concurrent_jobs
-        if _server_config
-        else (_config.max_concurrent_jobs if _config else 1)
-    )
+    max_jobs = _daemon_max_concurrent_jobs()
     log.info("Queue worker started (max_concurrent_jobs=%s)", max_jobs)
     while True:
         try:
@@ -604,13 +607,7 @@ async def health() -> dict:
     pending = sum(len(runtime.store.list_job_ids(status=JobStatus.PENDING)) for runtime in runtimes.values())
     running = sum(len(runtime.store.list_job_ids(status=JobStatus.RUNNING)) for runtime in runtimes.values())
     active = len(set().union(*_active_job_ids_by_project(runtimes).values()))
-    max_jobs = (
-        _lan_max_concurrent_jobs
-        if _is_lan_mode()
-        else _server_config.max_concurrent_jobs
-        if _server_config
-        else (_config.max_concurrent_jobs if _config else 1)
-    )
+    max_jobs = _daemon_max_concurrent_jobs()
     default = _default_project or (_config.project if _config else None)
     return {
         "status": "ok",
@@ -884,15 +881,25 @@ async def list_jobs(limit: int = 20) -> list[dict]:
 def _job_queue_entry(project: str, job: dict) -> dict:
     """Compact active-queue fields for one job, without secrets or commands."""
     stages = job.get("stages") or {}
+    steps = job.get("steps") or []
+    status = job.get("status")
     current_stage = None
     next_stage = None
-    for step, stage in stages.items():
-        stage_status = stage.get("status")
-        if stage_status == "running":
-            current_stage = step
-        elif stage_status == "pending" and next_stage is None:
-            next_stage = step
-    if current_stage is None and job.get("status") == JobStatus.RUNNING:
+    if stages:
+        for step, stage in stages.items():
+            if stage.get("status") == "running":
+                current_stage = step
+            elif stage.get("status") == "pending" and next_stage is None:
+                next_stage = step
+    elif status == JobStatus.RUNNING:
+        current_stage = job.get("current_step")
+        if current_stage and current_stage in steps:
+            following = steps[steps.index(current_stage) + 1:]
+            if following:
+                next_stage = following[0]
+    elif status == JobStatus.PENDING and steps:
+        next_stage = steps[0]
+    if current_stage is None and status == JobStatus.RUNNING:
         current_stage = job.get("current_step")
     stage_id = current_stage or next_stage
     queue = (stages.get(stage_id) or {}).get("queue") if stage_id else None
@@ -900,7 +907,7 @@ def _job_queue_entry(project: str, job: dict) -> dict:
         "job_id": job.get("job_id"),
         "project": project,
         "version": job.get("version"),
-        "status": job.get("status"),
+        "status": status,
         "current_stage": current_stage,
         "next_stage": next_stage,
         "queue": queue,
@@ -911,29 +918,50 @@ def _job_queue_entry(project: str, job: dict) -> dict:
     }
 
 
+def _scheduler_pending_order() -> list[tuple[ProjectRuntime, dict]]:
+    """Order pending jobs exactly as the queue worker would claim them.
+
+    Jobs the worker can claim right now come first, in global scheduler order
+    (per-project concurrency limits applied). Jobs blocked behind a saturated
+    project follow by age. This keeps queue_position consistent with dispatch
+    order instead of a naive global created_at sort.
+    """
+    runtimes = _runtime_map()
+    claimable = _pending_candidates(_daemon_max_concurrent_jobs())
+    claimable_ids = {(runtime.project, job["job_id"]) for runtime, job in claimable}
+    ordered = list(claimable)
+    deferred: list[tuple[str, ProjectRuntime, dict]] = []
+    for runtime in runtimes.values():
+        for job in runtime.store.list_jobs(
+            status=JobStatus.PENDING, limit=None, oldest_first=True
+        ):
+            if (runtime.project, job["job_id"]) in claimable_ids:
+                continue
+            deferred.append((job.get("created_at") or "", runtime, job))
+    deferred.sort(key=lambda item: item[0])
+    ordered.extend((runtime, job) for _, runtime, job in deferred)
+    return ordered
+
+
 def _active_queue_entries() -> tuple[list[dict], list[dict]]:
-    """Return (running, pending) job entries in scheduler order."""
+    """Return (running, pending) entries matching health counts.
+
+    Only loaded runtimes contribute. Dormant LAN stores are historical; a job
+    still marked pending or running there is stale, so counting it would make
+    the queue disagree with /api/health.
+    """
     runtimes = _runtime_map()
     running: list[dict] = []
-    pending: list[dict] = []
     for runtime in runtimes.values():
-        for status, bucket in (
-            (JobStatus.RUNNING, running),
-            (JobStatus.PENDING, pending),
+        for job in runtime.store.list_jobs(
+            status=JobStatus.RUNNING, limit=None, oldest_first=True
         ):
-            for job in runtime.store.list_jobs(
-                status=status, limit=1000, oldest_first=True
-            ):
-                bucket.append(_job_queue_entry(runtime.project, job))
-    for project, store, _ in _persisted_lan_stores():
-        for status, bucket in (
-            (JobStatus.RUNNING, running),
-            (JobStatus.PENDING, pending),
-        ):
-            for job in store.list_jobs(status=status, limit=1000, oldest_first=True):
-                bucket.append(_job_queue_entry(project, job))
+            running.append(_job_queue_entry(runtime.project, job))
     running.sort(key=lambda entry: entry.get("started_at") or entry.get("created_at") or "")
-    pending.sort(key=lambda entry: entry.get("created_at") or "")
+    pending = [
+        _job_queue_entry(runtime.project, job)
+        for runtime, job in _scheduler_pending_order()
+    ]
     for position, entry in enumerate(pending, start=1):
         entry["queue_position"] = position
     return running, pending
@@ -944,7 +972,7 @@ async def active_queue() -> dict:
     """Read-only ordered view of running and pending work for external monitors.
 
     Running jobs are listed first, oldest start first, followed by pending jobs
-    in queue order. Each entry exposes only identifiers, status, stage/queue
+    in scheduler order. Each entry exposes only identifiers, status, stage/queue
     position, and times - never commands, environment values, or secrets.
     """
     runtimes = _runtime_map()
@@ -952,13 +980,7 @@ async def active_queue() -> dict:
         _refresh_project_runtime(runtime)
     running, pending = _active_queue_entries()
     active = len(set().union(*_active_job_ids_by_project(runtimes).values()))
-    max_jobs = (
-        _lan_max_concurrent_jobs
-        if _is_lan_mode()
-        else _server_config.max_concurrent_jobs
-        if _server_config
-        else (_config.max_concurrent_jobs if _config else 1)
-    )
+    max_jobs = _daemon_max_concurrent_jobs()
     return {
         "jobs": running + pending,
         "pending_jobs": len(pending),
