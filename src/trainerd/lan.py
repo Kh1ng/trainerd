@@ -430,43 +430,70 @@ def _require_writable_checkout(checkout: Path) -> None:
     """Fail before sync when the current account cannot write Git metadata.
 
     A checkout may have reflogs or refs owned by a different Windows account
-    after a service-user change. The root can look writable while inherited or
-    protected files are not, so probe the actual Git metadata directory instead
-    of relying on permission bits.
+    after a service-user change. The `.git` root can look writable while an
+    existing reflog is not, so probe the nested paths `git fetch` writes
+    instead of relying on the root or on permission bits.
     """
-    git_dir = _git_metadata_dir(checkout)
+    git_dir = checkout / ".git"
     service = getpass.getuser()
-    probe = git_dir / f".trainerd-write-probe-{os.getpid()}"
-    try:
-        probe.touch(exist_ok=False)
-        probe.unlink()
-    except OSError as exc:
+    problems: list[str] = []
+    if not _probe_writable_dir(git_dir):
+        problems.append(f"Git metadata root is not writable: {git_dir}")
+    for relative in sorted(_existing_reflogs(git_dir)):
+        if not _probe_appendable(git_dir / relative):
+            problems.append(f"Reflog is not writable: {relative}")
+    for relative in (
+        "logs",
+        "refs",
+        "logs/refs/remotes",
+        "refs/remotes",
+        "logs/refs/heads",
+        "refs/heads",
+    ):
+        directory = git_dir / relative
+        if directory.is_dir() and not _probe_writable_dir(directory):
+            problems.append(f"Git metadata directory is not writable: {relative}")
+    if problems:
         raise LanConfigError(
             f"Managed checkout Git metadata is not writable by the current "
-            f"service identity {service!r}: {checkout} ({exc}). "
+            f"service identity {service!r}: {checkout} ({'; '.join(problems)}). "
             f"Grant the trainerd service account recursive control of the "
             f"checkout, or keep the state directory owned by one stable "
             f"Windows account, then resubmit."
-        ) from exc
+        )
 
 
-def _git_metadata_dir(checkout: Path) -> Path:
-    """Return the actual Git metadata directory for a checkout or worktree."""
-    git_entry = checkout / ".git"
-    if git_entry.is_dir():
-        return git_entry
-    if git_entry.is_file():
-        try:
-            text = git_entry.read_text(encoding="utf-8", errors="replace").strip()
-            prefix = "gitdir:"
-            if text.startswith(prefix):
-                target = Path(text[len(prefix):].strip())
-                if not target.is_absolute():
-                    target = checkout / target
-                return target.resolve()
-        except OSError:
-            pass
-    return git_entry
+def _existing_reflogs(git_dir: Path) -> list[Path]:
+    """Relative paths of every reflog file under the metadata directory."""
+    logs = git_dir / "logs"
+    if not logs.is_dir():
+        return []
+    return [path.relative_to(git_dir) for path in logs.rglob("*") if path.is_file()]
+
+
+def _probe_appendable(path: Path) -> bool:
+    """Check write permission by opening append-only; no content is written."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    except OSError:
+        return False
+    os.close(fd)
+    return True
+
+
+def _probe_writable_dir(path: Path) -> bool:
+    """Check that a new entry can be created in a directory."""
+    probe = path / f".trainerd-write-probe-{os.getpid()}"
+    try:
+        fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except OSError:
+        return False
+    os.close(fd)
+    try:
+        probe.unlink()
+    except OSError:
+        return False
+    return True
 
 
 def _git(repo_path: Path, *args: str) -> str:

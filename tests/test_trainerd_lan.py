@@ -623,3 +623,59 @@ def test_prepare_lan_project_fails_actionably_when_git_metadata_unwritable(
     assert str(checkout) in message
     assert "service identity" in message
     assert "stable Windows account" in message
+
+
+def test_prepare_lan_project_probes_existing_reflog_writability(tmp_path: Path) -> None:
+    if sys.platform == "win32":
+        pytest.skip("POSIX permission bits are not authoritative on Windows")
+    state_dir = tmp_path / "state"
+    repo_url = normalize_repo_url("http://git.local/team/repo.git")
+    checkout = state_dir / "repos" / repo_key(repo_url)
+    checkout.parent.mkdir(parents=True)
+    subprocess.run(["git", "init", str(checkout)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(checkout), "remote", "add", "origin", "http://git.local/team/repo.git"],
+        check=True,
+        capture_output=True,
+    )
+    _write_manifest(checkout)
+    (checkout / "tracked.txt").write_text("one\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.name", "Test"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.email", "test@example.com"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "add", ".trainerd.yaml", "tracked.txt"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "commit", "-m", "one"],
+        check=True,
+        capture_output=True,
+    )
+
+    # The issue's exact failure mode: a writable .git root containing an
+    # unwritable existing reflog. The root probe passes; the reflog probe must
+    # still catch it before git fetch fails mid-job.
+    git_dir = checkout / ".git"
+    reflog = git_dir / "logs" / "refs" / "remotes" / "origin" / "main"
+    reflog.parent.mkdir(parents=True)
+    reflog.write_text("", encoding="utf-8")
+    reflog.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+    try:
+        with pytest.raises(LanConfigError) as error:
+            prepare_lan_project(state_dir, repo_url, "nfl-train")
+    finally:
+        reflog.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+
+    message = str(error.value)
+    assert "Reflog is not writable" in message
+    assert "logs/refs/remotes" in message
+    assert "service identity" in message
