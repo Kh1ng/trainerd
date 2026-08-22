@@ -881,6 +881,95 @@ async def list_jobs(limit: int = 20) -> list[dict]:
     return sorted(jobs, key=lambda job: job.get("created_at") or "", reverse=True)[:limit]
 
 
+def _job_queue_entry(project: str, job: dict) -> dict:
+    """Compact active-queue fields for one job, without secrets or commands."""
+    stages = job.get("stages") or {}
+    current_stage = None
+    next_stage = None
+    for step, stage in stages.items():
+        stage_status = stage.get("status")
+        if stage_status == "running":
+            current_stage = step
+        elif stage_status == "pending" and next_stage is None:
+            next_stage = step
+    if current_stage is None and job.get("status") == JobStatus.RUNNING:
+        current_stage = job.get("current_step")
+    stage_id = current_stage or next_stage
+    queue = (stages.get(stage_id) or {}).get("queue") if stage_id else None
+    return {
+        "job_id": job.get("job_id"),
+        "project": project,
+        "version": job.get("version"),
+        "status": job.get("status"),
+        "current_stage": current_stage,
+        "next_stage": next_stage,
+        "queue": queue,
+        "queue_position": None,
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "steps": job.get("steps") or [],
+    }
+
+
+def _active_queue_entries() -> tuple[list[dict], list[dict]]:
+    """Return (running, pending) job entries in scheduler order."""
+    runtimes = _runtime_map()
+    running: list[dict] = []
+    pending: list[dict] = []
+    for runtime in runtimes.values():
+        for status, bucket in (
+            (JobStatus.RUNNING, running),
+            (JobStatus.PENDING, pending),
+        ):
+            for job in runtime.store.list_jobs(
+                status=status, limit=1000, oldest_first=True
+            ):
+                bucket.append(_job_queue_entry(runtime.project, job))
+    for project, store, _ in _persisted_lan_stores():
+        for status, bucket in (
+            (JobStatus.RUNNING, running),
+            (JobStatus.PENDING, pending),
+        ):
+            for job in store.list_jobs(status=status, limit=1000, oldest_first=True):
+                bucket.append(_job_queue_entry(project, job))
+    running.sort(key=lambda entry: entry.get("started_at") or entry.get("created_at") or "")
+    pending.sort(key=lambda entry: entry.get("created_at") or "")
+    for position, entry in enumerate(pending, start=1):
+        entry["queue_position"] = position
+    return running, pending
+
+
+@app.get("/api/queue", dependencies=[Depends(_read_api_key_auth)])
+async def active_queue() -> dict:
+    """Read-only ordered view of running and pending work for external monitors.
+
+    Running jobs are listed first, oldest start first, followed by pending jobs
+    in queue order. Each entry exposes only identifiers, status, stage/queue
+    position, and times - never commands, environment values, or secrets.
+    """
+    runtimes = _runtime_map()
+    for runtime in runtimes.values():
+        _refresh_project_runtime(runtime)
+    running, pending = _active_queue_entries()
+    active = len(set().union(*_active_job_ids_by_project(runtimes).values()))
+    max_jobs = (
+        _lan_max_concurrent_jobs
+        if _is_lan_mode()
+        else _server_config.max_concurrent_jobs
+        if _server_config
+        else (_config.max_concurrent_jobs if _config else 1)
+    )
+    return {
+        "jobs": running + pending,
+        "pending_jobs": len(pending),
+        "running_jobs": len(running),
+        "max_concurrent_jobs": max_jobs,
+        "queue_capacity": max(max_jobs - active, 0),
+        "stage_queues": _stage_queues.snapshot() if _stage_queues else None,
+        "authentication_required": bool(_configured_api_key()),
+    }
+
+
 @app.get("/api/jobs/{job_id}", dependencies=[Depends(_read_api_key_auth)])
 async def get_job(job_id: str) -> dict:
     found = _find_job_runtime(job_id)
