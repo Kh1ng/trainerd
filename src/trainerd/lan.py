@@ -6,6 +6,7 @@ provide commands or filesystem paths.
 """
 from __future__ import annotations
 
+import getpass
 import hashlib
 import os
 import re
@@ -135,6 +136,7 @@ def prepare_lan_project(
         actual_url = _git(checkout, "remote", "get-url", "origin").strip()
         if normalize_repo_url(actual_url) != normalized_url:
             raise LanConfigError("Managed checkout origin does not match requested repo")
+        _require_writable_checkout(checkout)
         _require_clean_tracked_checkout(checkout)
         _git(checkout, "fetch", "origin")
         if selected_branch is not None:
@@ -422,6 +424,49 @@ def _require_clean_tracked_checkout(repo_path: Path) -> None:
             )
         if result.returncode != 0:
             raise LanConfigError(f"Could not inspect managed checkout: {result.stderr.strip()}")
+
+
+def _require_writable_checkout(checkout: Path) -> None:
+    """Fail before sync when the current account cannot write Git metadata.
+
+    A checkout may have reflogs or refs owned by a different Windows account
+    after a service-user change. The root can look writable while inherited or
+    protected files are not, so probe the actual Git metadata directory instead
+    of relying on permission bits.
+    """
+    git_dir = _git_metadata_dir(checkout)
+    service = getpass.getuser()
+    probe = git_dir / f".trainerd-write-probe-{os.getpid()}"
+    try:
+        probe.touch(exist_ok=False)
+        probe.unlink()
+    except OSError as exc:
+        raise LanConfigError(
+            f"Managed checkout Git metadata is not writable by the current "
+            f"service identity {service!r}: {checkout} ({exc}). "
+            f"Grant the trainerd service account recursive control of the "
+            f"checkout, or keep the state directory owned by one stable "
+            f"Windows account, then resubmit."
+        ) from exc
+
+
+def _git_metadata_dir(checkout: Path) -> Path:
+    """Return the actual Git metadata directory for a checkout or worktree."""
+    git_entry = checkout / ".git"
+    if git_entry.is_dir():
+        return git_entry
+    if git_entry.is_file():
+        try:
+            text = git_entry.read_text(encoding="utf-8", errors="replace").strip()
+            prefix = "gitdir:"
+            if text.startswith(prefix):
+                target = Path(text[len(prefix):].strip())
+                if not target.is_absolute():
+                    target = checkout / target
+                return target.resolve()
+        except OSError:
+            pass
+    return git_entry
 
 
 def _git(repo_path: Path, *args: str) -> str:

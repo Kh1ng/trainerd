@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import stat
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,6 +21,7 @@ from trainerd.lan import (
     load_lan_task,
     normalize_branch,
     normalize_repo_url,
+    prepare_lan_project,
     repo_key,
 )
 from trainerd.storage import JobStore
@@ -568,3 +571,55 @@ def test_lan_reads_persisted_jobs_after_restart(tmp_path: Path) -> None:
             server._config,
             server._config_path,
         ) = old_state
+
+
+def test_prepare_lan_project_fails_actionably_when_git_metadata_unwritable(
+    tmp_path: Path,
+) -> None:
+    if sys.platform == "win32":
+        pytest.skip("POSIX permission bits are not authoritative on Windows")
+    state_dir = tmp_path / "state"
+    repo_url = normalize_repo_url("http://git.local/team/repo.git")
+    checkout = state_dir / "repos" / repo_key(repo_url)
+    checkout.parent.mkdir(parents=True)
+    subprocess.run(["git", "init", str(checkout)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(checkout), "remote", "add", "origin", "http://git.local/team/repo.git"],
+        check=True,
+        capture_output=True,
+    )
+    _write_manifest(checkout)
+    (checkout / "tracked.txt").write_text("one\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.name", "Test"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.email", "test@example.com"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "add", ".trainerd.yaml", "tracked.txt"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "commit", "-m", "one"],
+        check=True,
+        capture_output=True,
+    )
+
+    git_dir = checkout / ".git"
+    git_dir.chmod(stat.S_IRUSR | stat.S_IXUSR)
+    try:
+        with pytest.raises(LanConfigError) as error:
+            prepare_lan_project(state_dir, repo_url, "nfl-train")
+    finally:
+        git_dir.chmod(stat.S_IRWXU)
+
+    message = str(error.value)
+    assert str(checkout) in message
+    assert "service identity" in message
+    assert "stable Windows account" in message

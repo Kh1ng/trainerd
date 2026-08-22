@@ -54,6 +54,15 @@ persisted job status and logs remain readable after daemon restarts.
 It listens on `0.0.0.0:7860`. On Windows, managed checkouts and job state
 default to `%PROGRAMDATA%\trainerd\state`; `--state-dir` can override this.
 
+One stable Windows account should own the state directory. If the daemon moves
+between an elevated shell, Task Scheduler, and a normal user session, Git
+reflogs in a managed checkout can end up owned by the earlier account. The next
+submit then fails during `git fetch` with `Permission denied`. trainerd probes
+the checkout's Git metadata before syncing and fails with an actionable message
+that names the checkout and the current service identity instead of failing
+mid-job. Grant the trainerd service account recursive control of the affected
+checkout, then resubmit.
+
 Submit one anonymous HTTP request containing only the Git HTTP URL and the
 repository-owned task name:
 
