@@ -8,9 +8,17 @@ or skipping the restore-on-failure path.
 """
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
+import subprocess
+
+import pytest
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "trainerd-upgrade.ps1"
+PREVIOUS_LAN_HEALTH = (
+    Path(__file__).resolve().parent / "fixtures" / "health-0.3.13-lan.json"
+)
 
 
 def _script_text() -> str:
@@ -99,11 +107,92 @@ def test_upgrade_script_compares_live_and_candidate_policy() -> None:
     policy_check = text.split("function Assert-SamePolicy", 1)[1].split(
         "function Stop-VerifiedTrainerdListener", 1
     )[0]
-    assert '"allowed_repository_count"' not in policy_check
     assert '$Expected.mode -eq "lan"' in policy_check
     assert '$fields += "projects"' in policy_check
-    assert "Assert-SamePolicy -Expected $live -Candidate $candidateHealth" in text
-    assert "Assert-SamePolicy -Expected $live -Candidate $installedHealth" in text
+    assert "-Candidate $candidateHealth" in text
+    assert "-Candidate $installedHealth" in text
+    assert text.count("-ExpectedLanPolicy $liveLanPolicy") == 2
+
+
+def test_upgrade_script_verifies_legacy_lan_policy_without_health_hash() -> None:
+    live = json.loads(PREVIOUS_LAN_HEALTH.read_text(encoding="utf-8"))
+    assert live["mode"] == "lan"
+    assert live["authentication_required"] is True
+    assert live["allowed_repository_count"] == 2
+    assert "lan_policy_hash" not in live
+
+    text = _script_text()
+    assert "function Get-LanPolicyJson" in text
+    assert "$liveLanPolicy = Get-LanPolicyJson -BaseUrl $HealthUrl" in text
+    assert "Could not verify live LAN policy" in text
+    assert "$Expected.allowed_repository_count" in text
+    assert "-ExpectedLanPolicy $liveLanPolicy" in text
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PowerShell regression")
+def test_legacy_lan_policy_fallback_runs_in_windows_powershell(tmp_path: Path) -> None:
+    text = _script_text()
+    functions = text[
+        text.index("function Get-LanPolicyJson"):
+        text.index("function Stop-VerifiedTrainerdListener")
+    ]
+    live = json.loads(PREVIOUS_LAN_HEALTH.read_text(encoding="utf-8"))
+    candidate = {**live, "version": "0.3.14", "lan_policy_hash": "candidate-hash"}
+    policy = json.dumps(
+        {
+            "repositories": [
+                {
+                    "repo": "http://git.local/team/one.git",
+                    "task_source": "repository_manifest",
+                    "tasks": [],
+                },
+                {
+                    "repo": "http://git.local/team/two.git",
+                    "task_source": "server_config",
+                    "tasks": ["train"],
+                },
+            ]
+        },
+        separators=(",", ":"),
+    )
+
+    def quoted(value: str) -> str:
+        return value.replace("'", "''")
+
+    harness = tmp_path / "legacy-policy.ps1"
+    harness.write_text(
+        functions
+        + f"""
+function Get-LanPolicyJson {{ param([string]$BaseUrl) return '{quoted(policy)}' }}
+$live = '{quoted(json.dumps(live))}' | ConvertFrom-Json
+$candidate = '{quoted(json.dumps(candidate))}' | ConvertFrom-Json
+Assert-SamePolicy -Expected $live -Candidate $candidate -ExpectedLanPolicy '{quoted(policy)}' -CandidateBaseUrl 'http://candidate'
+function Get-LanPolicyJson {{ param([string]$BaseUrl) return '{{\"repositories\":[]}}' }}
+$rejected = $false
+try {{
+    Assert-SamePolicy -Expected $live -Candidate $candidate -ExpectedLanPolicy '{quoted(policy)}' -CandidateBaseUrl 'http://candidate'
+}}
+catch {{
+    $rejected = $true
+}}
+if (-not $rejected) {{ throw 'Mismatched legacy LAN policy was accepted.' }}
+""",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(harness),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
 
 
 def test_upgrade_script_uses_direct_trainerd_scheduled_task_action() -> None:
