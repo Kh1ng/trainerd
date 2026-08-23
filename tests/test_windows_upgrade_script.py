@@ -37,6 +37,8 @@ def test_upgrade_script_installs_fresh_versioned_venv_and_probes_alternate_port(
     text = _script_text()
     assert 'venvs\\$Version' in text
     assert "py -3.12 -m venv" in text
+    assert "-m pip install --upgrade pip" not in text
+    assert "& $pythonExe -m pip install $WheelUrl" in text
     # A stale candidate environment must be rebuilt, never reused.
     assert "Remove-Item -Recurse -Force $venvDir" in text
     assert "-ProbePort" in text or "$ProbePort" in text
