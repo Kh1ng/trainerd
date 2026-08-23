@@ -121,6 +121,7 @@ def test_trainerd_source_is_domain_neutral() -> None:
 
 def test_trainerd_job_payload_validation_rejects_domain_fields() -> None:
     assert validate_payload({"version": "v42", "steps": ["pull", "train"], "force": True}) == []
+    assert validate_payload({"version": None, "steps": None}) == []
 
     problems = validate_payload({"version": 42, "steps": ["train", 2], "sport": "soccer"})
 

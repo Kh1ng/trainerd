@@ -38,6 +38,7 @@ Exact arguments after `trainerd serve` for the replacement daemon.
 .PARAMETER ProbeArguments
 Exact arguments after `trainerd serve` for the isolated candidate probe. Use
 {probe_port} and {probe_state_dir} placeholders where those values belong.
+Quote {probe_state_dir}; the helper preserves the caller's quoting.
 
 .PARAMETER TaskName
 Name of the Scheduled Task that runs the daemon (default: trainerd-lan).
@@ -224,7 +225,7 @@ function Restore-PriorAction {
         [string]$WorkingDirectory,
         [string]$ExpectedVersion
     )
-    if (-not (Stop-DaemonTask -ExpectedVersion $Version)) {
+    if (-not (Stop-DaemonTask -ExpectedVersion $ExpectedVersion)) {
         return $false
     }
     $oldAction = New-ScheduledTaskAction -Execute $Execute -Argument $Arguments -WorkingDirectory $WorkingDirectory
@@ -285,7 +286,7 @@ Write-Host "Probing candidate on port $ProbePort with isolated state $probeDir .
 $probeOutputLog = Join-Path $logDir "probe-$Version.stdout.log"
 $probeErrorLog = Join-Path $logDir "probe-$Version.stderr.log"
 $probeHealth = "http://127.0.0.1:$ProbePort"
-$probeArgumentsResolved = $ProbeArguments.Replace("{probe_port}", "$ProbePort").Replace("{probe_state_dir}", "`"$probeDir`"")
+$probeArgumentsResolved = $ProbeArguments.Replace("{probe_port}", "$ProbePort").Replace("{probe_state_dir}", "$probeDir")
 $probeProcess = Start-Process -FilePath $pythonExe `
     -ArgumentList "-m trainerd serve $probeArgumentsResolved" `
     -RedirectStandardOutput $probeOutputLog `
