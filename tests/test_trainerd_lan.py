@@ -315,6 +315,43 @@ def test_cli_lan_mode_passes_persistent_config() -> None:
     assert serve.call_args.kwargs["lan_config"] == "C:/ProgramData/trainerd/lan.yaml"
 
 
+def test_cli_lan_policy_hash_tracks_commands_and_environment(
+    tmp_path: Path, capsys
+) -> None:
+    path = tmp_path / "lan.yaml"
+    config = {
+        "version": 1,
+        "repositories": [
+            {
+                "repo": "http://git.local/team/server.git",
+                "tasks": {
+                    "train": {
+                        "steps": [
+                            {"id": "run", "cmd": "train", "env": {"MODE": "one"}}
+                        ]
+                    }
+                },
+            }
+        ],
+    }
+
+    hashes = []
+    for command, environment in (
+        ("train", "one"),
+        ("train --changed", "one"),
+        ("train", "two"),
+    ):
+        step = config["repositories"][0]["tasks"]["train"]["steps"][0]
+        step["cmd"] = command
+        step["env"]["MODE"] = environment
+        path.write_text(yaml.safe_dump(config), encoding="utf-8")
+        assert trainerd_main(["policy-hash", "--lan-config", str(path)]) == 0
+        hashes.append(capsys.readouterr().out.strip())
+
+    assert all(len(value) == 64 for value in hashes)
+    assert len(set(hashes)) == 3
+
+
 def test_lan_allowlist_requires_api_key_and_normalizes(monkeypatch) -> None:
     monkeypatch.setenv(
         "TRAINERD_ALLOWED_REPOS",

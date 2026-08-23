@@ -88,6 +88,21 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_policy_hash(args: argparse.Namespace) -> int:
+    from .lan import LanConfigError, load_lan_server_config
+    from .runtime import DaemonRuntime
+
+    try:
+        repositories = load_lan_server_config(Path(args.lan_config))
+    except LanConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    runtime = DaemonRuntime()
+    runtime.lan_repositories = repositories
+    print(runtime.lan_policy_hash())
+    return 0
+
+
 def _env_state_dir(value: str | None) -> Path:
     if value:
         return Path(value).expanduser().resolve()
@@ -286,6 +301,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Persistent server-owned LAN repository and task configuration.",
     )
     serve.set_defaults(func=_cmd_serve)
+
+    policy_hash = sub.add_parser(
+        "policy-hash",
+        help="Print the complete policy hash for a LAN config.",
+    )
+    policy_hash.add_argument("--lan-config", required=True)
+    policy_hash.set_defaults(func=_cmd_policy_hash)
 
     env = sub.add_parser(
         "env",
