@@ -11,8 +11,8 @@ import fnmatch
 import json
 import logging
 import os
-import signal
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -96,6 +96,8 @@ class StageQueuePool:
 
 
 class JobRunner:
+    """Run, cancel, recover, and promote jobs for one project."""
+
     def __init__(
         self,
         store: JobStore,
@@ -117,6 +119,7 @@ class JobRunner:
         self._running_procs: dict[str, asyncio.subprocess.Process | None] = {}
 
     def update_config(self, config: TrainingConfig, *, config_path: Path | None = None) -> None:
+        """Replace reloadable project configuration without changing identity."""
         if self._project is not None and config.project != self._project:
             raise ValueError(
                 f"Refusing to change runner project from {self._project!r} "
@@ -165,10 +168,11 @@ class JobRunner:
         return self._config
 
     async def run_job(self, job_id: str) -> None:
+        """Run a pending job through its configured steps and finalization."""
         job = self._store.get_job(job_id)
         if not job:
             return
-        if job["status"] in (JobStatus.FAILED, JobStatus.PROMOTED, JobStatus.COMPLETED):
+        if JobStatus.is_terminal(job["status"]):
             return
         repo_sha = str(job.get("repo_sha") or "")
         if not repo_sha:
@@ -224,7 +228,7 @@ class JobRunner:
         if not job:
             return
         # Don't start if the job was already cancelled/marked failed
-        if job["status"] in (JobStatus.FAILED, JobStatus.PROMOTED, JobStatus.COMPLETED):
+        if JobStatus.is_terminal(job["status"]):
             return
         config = config or self._load_current_config()
         log_path = config.log_dir / f"{job_id}.log"
@@ -273,7 +277,7 @@ class JobRunner:
                 _log(f"--- Step: {step.name} ---")
                 repo_path = str(config.repo.local_path)
                 work_dir = str(config.work_dir)
-                cmd = _resolve_cmd(
+                cmd = _resolve_template(
                     step.cmd,
                     version=version,
                     repo_path=repo_path,
@@ -388,14 +392,15 @@ class JobRunner:
             _log(f"=== Job {job_id} DONE. status={self._store.get_job(job_id, 'status')} ===")
 
     async def promote_job(self, job_id: str, logfile=None, version: str | None = None) -> None:
+        """Copy validated output into the configured repository and commit it."""
         if not self._config.promotion:
             return
         if version is None:
             version = self._store.get_job(job_id, "version") or "unknown"
         prom = self._config.promotion
-        source_dir = Path(_resolve_cmd(prom.source_dir, version=version))
+        source_dir = Path(_resolve_template(prom.source_dir, version=version))
         repo_path = Path(self._config.repo.local_path)
-        dest_dir = repo_path / _resolve_cmd(prom.repo_subdir, version=version)
+        dest_dir = repo_path / _resolve_template(prom.repo_subdir, version=version)
 
         def _log(msg: str) -> None:
             ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
@@ -535,26 +540,6 @@ def _resolve_template(
         .replace("{branch}", branch)
         .replace("{markets_flag}", f"--markets {markets}" if markets else "")
         .replace("{extra_args}", extra_args)
-    )
-
-
-def _resolve_cmd(
-    template: str,
-    version: str = "",
-    repo_path: str = "",
-    work_dir: str = "",
-    branch: str = "",
-    markets: str = "",
-    extra_args: str = "",
-) -> str:
-    return _resolve_template(
-        template,
-        version=version,
-        repo_path=repo_path,
-        work_dir=work_dir,
-        branch=branch,
-        markets=markets,
-        extra_args=extra_args,
     )
 
 
@@ -747,9 +732,9 @@ async def _validate(
     *,
     repo_sha: str = "",
 ) -> tuple[bool, dict]:
-    cmd = _resolve_cmd(val_cfg.cmd, version=version)
-    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
-        out_path = tmp.name
+    cmd = _resolve_template(val_cfg.cmd, version=version)
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as output_file:
+        out_path = output_file.name
 
     full_cmd = f"{cmd} --output-json {out_path}" if val_cfg.output_is_json else cmd
     full_env = {**os.environ, **_with_repo_pythonpath(str(getattr(val_cfg, "cwd", "") or ""), getattr(val_cfg, "env", None) or {})}
@@ -773,8 +758,8 @@ async def _validate(
         if val_cfg.output_is_json and Path(out_path).exists():
             try:
                 result.update(json.loads(Path(out_path).read_text()))
-            except Exception:
-                pass
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                result["output_error"] = str(exc)
         Path(out_path).unlink(missing_ok=True)
 
         if val_cfg.output_is_json:

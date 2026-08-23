@@ -170,31 +170,18 @@ def test_server_routes_jobs_only_to_explicit_allowlisted_project(
             JobRunner(store, config, config_path=path),
         )
 
-    old_state = (
-        server._server_config,
-        server._projects,
-        server._default_project,
-        server._store,
-        server._runner,
-        server._config,
-        server._config_path,
-        server._running_tasks,
+    server._runtime.configure_projects(
+        ServerConfig(
+            projects=configured,
+            default_project="alpha",
+            api_key="shared-key",
+            server_port=7860,
+            max_concurrent_jobs=1,
+            registry_mode=True,
+        ),
+        server.StageQueuePool(),
+        projects=runtimes,
     )
-    server._server_config = ServerConfig(
-        projects=configured,
-        default_project="alpha",
-        api_key="shared-key",
-        server_port=7860,
-        max_concurrent_jobs=1,
-        registry_mode=True,
-    )
-    server._projects = runtimes
-    server._default_project = "alpha"
-    server._store = runtimes["alpha"].store
-    server._runner = runtimes["alpha"].runner
-    server._config = runtimes["alpha"].config
-    server._config_path = runtimes["alpha"].config_path
-    server._running_tasks = {}
 
     client = TestClient(server.app)
     headers = {"X-API-Key": "shared-key"}
@@ -286,15 +273,15 @@ def test_server_routes_jobs_only_to_explicit_allowlisted_project(
         beta_id = beta_submit.json()["job_id"]
         runtimes["alpha"].store.update_job(alpha_id, created_at="2026-01-02T00:00:00Z")
         runtimes["beta"].store.update_job(beta_id, created_at="2026-01-01T00:00:00Z")
-        candidates = server._pending_candidates(1)
+        candidates = server._runtime.pending_candidates(1)
         assert [(runtime.project, job["job_id"]) for runtime, job in candidates] == [
             ("beta", beta_id)
         ]
 
         # A claimed-but-not-yet-running task reserves beta's per-project slot.
         reserved_task = Mock()
-        server._running_tasks[beta_id] = reserved_task  # type: ignore[assignment]
-        candidates = server._pending_candidates(2)
+        server._runtime.running_tasks[beta_id] = reserved_task  # type: ignore[assignment]
+        candidates = server._runtime.pending_candidates(2)
         assert [(runtime.project, job["job_id"]) for runtime, job in candidates] == [
             ("alpha", alpha_id)
         ]
@@ -316,16 +303,7 @@ def test_server_routes_jobs_only_to_explicit_allowlisted_project(
         reserved_task.cancel.assert_called_once_with()
     finally:
         client.close()
-        (
-            server._server_config,
-            server._projects,
-            server._default_project,
-            server._store,
-            server._runner,
-            server._config,
-            server._config_path,
-            server._running_tasks,
-        ) = old_state
+        server._runtime.reset()
 
 
 def test_runner_refuses_project_identity_change_during_reload(tmp_path: Path) -> None:
@@ -359,23 +337,24 @@ def test_registry_mode_with_one_project_still_requires_explicit_project(
         store,
         JobRunner(store, config, config_path=path),
     )
-    old_state = (server._server_config, server._projects, server._default_project)
-    server._server_config = ServerConfig(
-        projects={"alpha": ConfiguredProject("alpha", path, config)},
-        default_project="alpha",
-        api_key="shared-key",
-        server_port=7860,
-        max_concurrent_jobs=1,
-        registry_mode=True,
+    server._runtime.configure_projects(
+        ServerConfig(
+            projects={"alpha": ConfiguredProject("alpha", path, config)},
+            default_project="alpha",
+            api_key="shared-key",
+            server_port=7860,
+            max_concurrent_jobs=1,
+            registry_mode=True,
+        ),
+        server.StageQueuePool(),
+        projects={"alpha": runtime},
     )
-    server._projects = {"alpha": runtime}
-    server._default_project = "alpha"
     try:
         with pytest.raises(Exception) as error:
             server._select_runtime()
         assert getattr(error.value, "status_code", None) == 400
     finally:
-        server._server_config, server._projects, server._default_project = old_state
+        server._runtime.reset()
 
 
 def test_duplicate_historical_job_ids_are_rejected_at_startup(tmp_path: Path) -> None:
@@ -393,8 +372,17 @@ def test_duplicate_historical_job_ids_are_rejected_at_startup(tmp_path: Path) ->
             JobRunner(store, config, config_path=path),
         )
 
+    configured = {
+        name: ConfiguredProject(name, runtime.config_path, runtime.config)
+        for name, runtime in runtimes.items()
+    }
     with pytest.raises(RuntimeError, match="Duplicate historical job id"):
-        server._validate_unique_job_ids(runtimes)
+        server._runtime.configure_projects(
+            ServerConfig(configured, "alpha", "key", 7860, 1, True),
+            server.StageQueuePool(),
+            projects=runtimes,
+        )
+    server._runtime.reset()
 
 
 def test_cli_submit_sends_project_without_paths_or_commands() -> None:
@@ -494,4 +482,5 @@ def test_cli_serve_passes_explicit_registry_and_listener() -> None:
         cpu_concurrency=None,
         gpu_capacity=None,
         allowed_repos=None,
+        lan_config=None,
     )

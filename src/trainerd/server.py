@@ -21,63 +21,48 @@ import os
 import re
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, Security
-from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.security import APIKeyHeader, APIKeyQuery
-from pydantic import BaseModel, ConfigDict, StrictBool, StrictStr
 
 from . import __version__
-from .config import ServerConfig, TrainingConfig, load_config, load_server_config
-from .contracts import ARTIFACT_MANIFEST_SCHEMA, validate_payload
+from .config import TrainingConfig, load_server_config
+from .contracts import (
+    ARTIFACT_MANIFEST_SCHEMA,
+    JobRequest,
+    is_safe_identifier,
+    validate_payload,
+)
 from .lan import (
     LanConfigError,
-    LanPreparedProject,
+    LanRepositoryPolicy,
     default_state_dir,
+    load_lan_server_config,
     normalize_repo_url,
     prepare_lan_project,
 )
-from .runner import JobRunner, StageQueuePool
-from .storage import JobStore, JobStatus
+from .runner import StageQueuePool
+from .runtime import (
+    DaemonRuntime,
+    ProjectRuntime,
+    RepositoryCapacityError,
+)
+from .storage import JobStatus
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
 
-_store: JobStore | None = None
-_runner: JobRunner | None = None
-_config: TrainingConfig | None = None
-_config_path: Path | None = None
-
-
-@dataclass
-class ProjectRuntime:
-    project: str
-    config_path: Path | None
-    config: TrainingConfig
-    store: JobStore
-    runner: JobRunner
-    lan_repo_key: str | None = None
-    workspace_lock: asyncio.Lock | None = None
-
-
-_server_config: ServerConfig | None = None
-_projects: dict[str, ProjectRuntime] = {}
-_default_project: str | None = None
-_lan_mode_active = False
-_lan_state_dir: Path | None = None
-_lan_max_concurrent_jobs = 1
-_lan_prepare_lock: asyncio.Lock | None = None
-_stage_queues: StageQueuePool | None = None
-
-# Queue worker state
-_queue_worker_task: asyncio.Task | None = None
-_running_tasks: dict[str, asyncio.Task] = {}
-_queue_poll_interval: float = 5.0
+_runtime = DaemonRuntime()
 _LAN_API_KEY_ENV = "TRAINERD_API_KEY"
 _LAN_ALLOWED_REPOS_ENV = "TRAINERD_ALLOWED_REPOS"
 _MAX_ARTIFACT_MANIFEST_BYTES = 1024 * 1024
@@ -85,37 +70,12 @@ _MAX_ARTIFACT_BYTES = 2 * 1024 * 1024 * 1024
 _MAX_ARTIFACTS = 256
 
 
-class JobRequest(BaseModel):
-    """Strict HTTP shape; project config paths/commands are never accepted."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    project: StrictStr | None = None
-    repo: StrictStr | None = None
-    repo_url: StrictStr | None = None
-    task: StrictStr | None = None
-    version: StrictStr | None = None
-    steps: list[StrictStr] | None = None
-    branch: StrictStr | None = None
-    markets: StrictStr | None = None
-    extra_args: StrictStr | None = None
-    force: StrictBool = False
-    triggered_by: StrictStr = "api"
-
-
-_SAFE_JOB_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 _api_key_query = APIKeyQuery(name="api_key", auto_error=False)
 
 
 def _configured_api_key() -> str:
-    return (
-        os.environ.get(_LAN_API_KEY_ENV, "").strip()
-        if _is_lan_mode()
-        else _server_config.api_key
-        if _server_config
-        else (_config.api_key if _config else "")
-    )
+    return os.environ.get(_LAN_API_KEY_ENV, "").strip() if _runtime.lan_mode else _runtime.api_key
 
 
 def _api_key_auth(
@@ -143,53 +103,13 @@ def _read_api_key_auth(
     header_key: str | None = Security(_api_key_header),
     query_key: str | None = Security(_api_key_query),
 ) -> None:
-    if not _is_lan_mode():
+    if not _runtime.lan_mode:
         _api_key_auth(header_key, query_key)
 
 
-def _runtime_map() -> dict[str, ProjectRuntime]:
-    if _projects:
-        return _projects
-    if _store is None or _runner is None or _config is None or _config_path is None:
-        return {}
-    return {
-        _config.project: ProjectRuntime(
-            project=_config.project,
-            config_path=_config_path,
-            config=_config,
-            store=_store,
-            runner=_runner,
-        )
-    }
-
-
-def _default_runtime() -> ProjectRuntime:
-    runtimes = _runtime_map()
-    project = _default_project or (_config.project if _config else None)
-    runtime = runtimes.get(project or "")
-    if runtime is None:
-        raise RuntimeError("trainerd has no configured default project")
-    return runtime
-
-
-def _is_registry_mode() -> bool:
-    return bool(_server_config and _server_config.registry_mode)
-
-
-def _is_lan_mode() -> bool:
-    return _lan_mode_active
-
-
-def _daemon_max_concurrent_jobs() -> int:
-    """Daemon-wide concurrency limit for the current mode."""
-    if _is_lan_mode():
-        return _lan_max_concurrent_jobs
-    if _server_config:
-        return _server_config.max_concurrent_jobs
-    return _config.max_concurrent_jobs if _config else 1
-
-
 def _lan_allowed_repo_urls() -> frozenset[str]:
+    if _runtime.lan_repositories:
+        return frozenset(_runtime.lan_repositories)
     values = [
         value.strip()
         for value in os.environ.get(_LAN_ALLOWED_REPOS_ENV, "").splitlines()
@@ -201,8 +121,28 @@ def _lan_allowed_repo_urls() -> frozenset[str]:
         raise ValueError(f"{_LAN_ALLOWED_REPOS_ENV} is invalid: {exc}") from exc
 
 
-def _validate_lan_security() -> frozenset[str]:
-    allowed_repos = _lan_allowed_repo_urls()
+def _load_lan_repositories() -> dict[str, LanRepositoryPolicy]:
+    if _runtime.lan_config_path is not None:
+        try:
+            return load_lan_server_config(_runtime.lan_config_path)
+        except LanConfigError as exc:
+            raise ValueError(f"LAN configuration is invalid: {exc}") from exc
+    values = [
+        value.strip()
+        for value in os.environ.get(_LAN_ALLOWED_REPOS_ENV, "").splitlines()
+        if value.strip()
+    ]
+    try:
+        urls = {normalize_repo_url(value) for value in values}
+    except LanConfigError as exc:
+        raise ValueError(f"{_LAN_ALLOWED_REPOS_ENV} is invalid: {exc}") from exc
+    return {repo_url: LanRepositoryPolicy(repo_url, None) for repo_url in urls}
+
+
+def _validate_lan_security(
+    allowed_repos: frozenset[str] | None = None,
+) -> frozenset[str]:
+    allowed_repos = allowed_repos if allowed_repos is not None else _lan_allowed_repo_urls()
     if allowed_repos and not os.environ.get(_LAN_API_KEY_ENV, "").strip():
         raise ValueError(
             f"{_LAN_API_KEY_ENV} is required when LAN repositories are allowlisted"
@@ -211,31 +151,19 @@ def _validate_lan_security() -> frozenset[str]:
 
 
 def _select_runtime(project: Any = None) -> ProjectRuntime:
-    requested = str(project) if project is not None else ""
-    if not requested:
-        if _is_registry_mode():
-            raise HTTPException(
-                status_code=400,
-                detail="project is required in trainerd registry mode",
-            )
-        return _default_runtime()
-    runtime = _runtime_map().get(requested)
-    if runtime is None:
-        allowed = ", ".join(sorted(_runtime_map()))
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown project {requested!r}. Allowed projects: {allowed}",
-        )
-    return runtime
+    try:
+        return _runtime.select(project)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _validate_multi_project_request(payload: dict[str, Any]) -> None:
-    if not _is_lan_mode() and any(field in payload for field in ("repo", "repo_url", "task")):
+    if not _runtime.lan_mode and any(field in payload for field in ("repo", "repo_url", "task")):
         raise HTTPException(
             status_code=400,
             detail="repo and task are accepted only when trainerd starts with --lan",
         )
-    if not _is_registry_mode():
+    if not _runtime.registry_mode:
         return
     if "branch" in payload:
         raise HTTPException(status_code=400, detail="branch is not accepted in registry mode")
@@ -243,12 +171,12 @@ def _validate_multi_project_request(payload: dict[str, Any]) -> None:
         raise HTTPException(status_code=400, detail="extra_args is not accepted in registry mode")
 
     version = payload.get("version")
-    if version is not None and not _SAFE_JOB_TOKEN.fullmatch(version):
+    if version is not None and not is_safe_identifier(version):
         raise HTTPException(status_code=400, detail="version contains unsupported characters")
 
     steps = payload.get("steps")
     if steps is not None:
-        if not steps or any(not _SAFE_JOB_TOKEN.fullmatch(step) for step in steps):
+        if not steps or any(not is_safe_identifier(step) for step in steps):
             raise HTTPException(status_code=400, detail="steps must be non-empty safe step ids")
 
     markets = payload.get("markets")
@@ -257,7 +185,7 @@ def _validate_multi_project_request(payload: dict[str, Any]) -> None:
         if (
             not market_ids
             or len(market_ids) > 64
-            or any(not _SAFE_JOB_TOKEN.fullmatch(market) for market in market_ids)
+            or any(not is_safe_identifier(market) for market in market_ids)
         ):
             raise HTTPException(
                 status_code=400,
@@ -265,155 +193,32 @@ def _validate_multi_project_request(payload: dict[str, Any]) -> None:
             )
 
 
-def _refresh_project_runtime(runtime: ProjectRuntime) -> TrainingConfig:
-    if runtime.config_path is None:
-        return runtime.config
-    refreshed = load_config(runtime.config_path)
-    if refreshed.project != runtime.project:
-        raise RuntimeError(
-            f"Configured project changed from {runtime.project!r} "
-            f"to {refreshed.project!r}"
-        )
-    runtime.config = refreshed
-    runtime.runner.update_config(refreshed, config_path=runtime.config_path)
-    if runtime.project == (_default_project or runtime.project):
-        global _config
-        _config = refreshed
-    return refreshed
-
-
-def _find_job_runtime(job_id: str) -> tuple[ProjectRuntime, dict] | None:
-    found: list[tuple[ProjectRuntime, dict]] = []
-    for runtime in _runtime_map().values():
-        job = runtime.store.get_job(job_id)
-        if job:
-            found.append((runtime, job))
-    if len(found) > 1:
-        projects = ", ".join(item[0].project for item in found)
-        raise RuntimeError(f"Ambiguous job id {job_id!r} exists in projects: {projects}")
-    return found[0] if found else None
-
-
-def _persisted_lan_stores() -> list[tuple[str, JobStore, Path]]:
-    if not _is_lan_mode() or _lan_state_dir is None:
-        return []
-    loaded_logs = {
-        runtime.config.log_dir.resolve() for runtime in _runtime_map().values()
-    }
-    root = _lan_state_dir / "jobs"
-    if not root.is_dir():
-        return []
-    return [
-        (path.name, JobStore(path / "jobs.db", read_only=True), path)
-        for path in root.iterdir()
-        if path.is_dir()
-        and (path / "jobs.db").is_file()
-        and path.resolve() not in loaded_logs
-    ]
-
-
-def _find_persisted_lan_job(
-    job_id: str,
-) -> tuple[str, JobStore, Path, dict] | None:
-    found = [
-        (project, store, log_dir, job)
-        for project, store, log_dir in _persisted_lan_stores()
-        if (job := store.get_job(job_id)) is not None
-    ]
-    if len(found) > 1:
-        projects = ", ".join(item[0] for item in found)
-        raise RuntimeError(
-            f"Ambiguous persisted job id {job_id!r} exists in projects: {projects}"
-        )
-    return found[0] if found else None
-
-
-def _validate_unique_job_ids(runtimes: dict[str, ProjectRuntime]) -> None:
-    owners: dict[str, str] = {}
-    for runtime in runtimes.values():
-        for job_id in runtime.store.list_job_ids():
-            prior = owners.setdefault(job_id, runtime.project)
-            if prior != runtime.project:
-                raise RuntimeError(
-                    f"Duplicate historical job id {job_id!r} exists in "
-                    f"projects {prior!r} and {runtime.project!r}"
-                )
-
-
 def _with_project(runtime: ProjectRuntime, job: dict) -> dict:
     return {**job, "project": runtime.project}
 
 
-def _active_job_ids_by_project(
-    runtimes: dict[str, ProjectRuntime] | None = None,
-) -> dict[str, set[str]]:
-    runtimes = runtimes or _runtime_map()
-    active_by_project: dict[str, set[str]] = {}
-    for runtime in runtimes.values():
-        running_ids = set(runtime.store.list_job_ids(status=JobStatus.RUNNING))
-        reserved_ids = {
-            job_id
-            for job_id in _running_tasks
-            if (found := _find_job_runtime(job_id)) and found[0].project == runtime.project
-        }
-        active_by_project[runtime.project] = running_ids | reserved_ids
-    return active_by_project
-
-
-def _pending_candidates(max_jobs: int) -> list[tuple[ProjectRuntime, dict]]:
-    """Return globally oldest claimable jobs with running-task reservations."""
-    runtimes = _runtime_map()
-    active_by_project = _active_job_ids_by_project(runtimes)
-    available = max(max_jobs - len(set().union(*active_by_project.values())), 0)
-    candidates: list[tuple[str, ProjectRuntime, dict]] = []
-    for runtime in runtimes.values():
-        project_available = max(
-            runtime.config.max_concurrent_jobs - len(active_by_project[runtime.project]),
-            0,
-        )
-        if project_available <= 0:
-            continue
-        pending = runtime.store.list_jobs(
-            status=JobStatus.PENDING,
-            limit=min(project_available, available),
-            oldest_first=True,
-        )
-        candidates.extend((job.get("created_at") or "", runtime, job) for job in pending)
-    return [
-        (runtime, job)
-        for _, runtime, job in sorted(candidates, key=lambda item: item[0])[:available]
-    ]
-
-
-def _recover_stale_jobs(runtime: ProjectRuntime) -> None:
-    """On startup, mark any running jobs as failed (interrupted by shutdown)."""
-    for job_id in runtime.runner.recover_interrupted_jobs():
-        status = runtime.store.get_job(job_id, "status")
-        log.warning("Recovered stale running job %s as %s", job_id, status)
-
-
 async def _queue_worker() -> None:
     """Dispatch queued jobs within daemon-wide and per-project limits."""
-    max_jobs = _daemon_max_concurrent_jobs()
+    max_jobs = _runtime.max_concurrent_jobs
     log.info("Queue worker started (max_concurrent_jobs=%s)", max_jobs)
     while True:
         try:
-            runtimes = _runtime_map()
+            runtimes = _runtime.projects
             if not runtimes:
-                await _wait_for_queue()
+                await _runtime.wait_for_queue()
                 continue
             for runtime in runtimes.values():
-                _refresh_project_runtime(runtime)
+                _runtime.refresh(runtime)
 
-            for runtime, job in _pending_candidates(max_jobs):
+            for runtime, job in _runtime.pending_candidates(max_jobs):
                 jid = job["job_id"]
-                if jid in _running_tasks:
+                if jid in _runtime.running_tasks:
                     continue
                 log.info("Queue worker claiming job %s for project %s", jid, runtime.project)
                 task = asyncio.create_task(_run_job_wrapper(jid, runtime.project))
-                _running_tasks[jid] = task
+                _runtime.running_tasks[jid] = task
 
-            await _wait_for_queue()
+            await _runtime.wait_for_queue()
         except asyncio.CancelledError:
             log.info("Queue worker cancelled")
             break
@@ -424,8 +229,8 @@ async def _queue_worker() -> None:
 
 async def _run_job_wrapper(job_id: str, project: str | None = None) -> None:
     """Wrap runner.run_job to handle exceptions."""
-    found = _find_job_runtime(job_id)
-    runtime = _select_runtime(project) if project else (found[0] if found else _default_runtime())
+    found = _runtime.find_job(job_id)
+    runtime = _select_runtime(project) if project else (found[0] if found else _runtime.default())
     try:
         await runtime.runner.run_job(job_id)
     except asyncio.CancelledError:
@@ -445,16 +250,12 @@ async def _run_job_wrapper(job_id: str, project: str | None = None) -> None:
         log.exception("Unexpected error in job %s", job_id)
         runtime.store.set_failed(job_id, "Internal error — see server logs")
     finally:
-        _running_tasks.pop(job_id, None)
-        _wake_queue()
+        _runtime.running_tasks.pop(job_id, None)
+        _runtime.wake_queue()
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    global _store, _runner, _config, _config_path, _queue_worker_task
-    global _server_config, _projects, _default_project
-    global _lan_mode_active, _lan_state_dir, _lan_max_concurrent_jobs, _lan_prepare_lock
-    global _stage_queues
     try:
         cpu_limit = int(os.environ.get("TRAINERD_CPU_CONCURRENCY", "1"))
     except ValueError as exc:
@@ -463,153 +264,94 @@ async def _lifespan(app: FastAPI):
         gpu_capacity = int(os.environ.get("TRAINERD_GPU_CAPACITY", "1"))
     except ValueError as exc:
         raise ValueError("TRAINERD_GPU_CAPACITY must be an integer") from exc
-    _stage_queues = StageQueuePool(cpu=cpu_limit, gpu=gpu_capacity)
-    _lan_mode_active = os.environ.get("TRAINERD_LAN_MODE") == "1"
-    _projects = {}
+    stage_queues = StageQueuePool(cpu=cpu_limit, gpu=gpu_capacity)
+    lan_mode = os.environ.get("TRAINERD_LAN_MODE") == "1"
     allowed_repos: frozenset[str] = frozenset()
-    if _lan_mode_active:
-        _server_config = None
-        _default_project = None
-        _store = None
-        _runner = None
-        _config = None
-        _config_path = None
+    if lan_mode:
         configured_state = os.environ.get("TRAINERD_STATE_DIR", "").strip()
-        _lan_state_dir = (
+        lan_state_dir = (
             Path(configured_state).expanduser().resolve()
             if configured_state
             else default_state_dir().expanduser().resolve()
         )
-        _lan_state_dir.mkdir(parents=True, exist_ok=True)
+        lan_state_dir.mkdir(parents=True, exist_ok=True)
         try:
-            _lan_max_concurrent_jobs = int(
+            max_concurrent_jobs = int(
                 os.environ.get("TRAINERD_MAX_CONCURRENT_JOBS", "1")
             )
         except ValueError as exc:
             raise ValueError("TRAINERD_MAX_CONCURRENT_JOBS must be an integer") from exc
-        if not 1 <= _lan_max_concurrent_jobs <= 64:
+        if not 1 <= max_concurrent_jobs <= 64:
             raise ValueError("TRAINERD_MAX_CONCURRENT_JOBS must be from 1 to 64")
-        allowed_repos = _validate_lan_security()
-        _lan_prepare_lock = asyncio.Lock()
+        lan_config_path = _runtime.lan_config_path
+        repositories = _load_lan_repositories()
+        allowed_repos = _validate_lan_security(frozenset(repositories))
+        _runtime.configure_lan(
+            lan_state_dir,
+            max_concurrent_jobs,
+            stage_queues,
+            repositories=repositories,
+            config_path=lan_config_path,
+        )
     else:
-        _server_config = load_server_config()
-        _default_project = _server_config.default_project
-        for configured in _server_config.projects.values():
-            store = JobStore(configured.config.log_dir / "jobs.db")
-            runner = JobRunner(
-                store,
-                configured.config,
-                config_path=configured.config_path,
-                queues=_stage_queues,
-            )
-            runtime = ProjectRuntime(
-                configured.project,
-                configured.config_path,
-                configured.config,
-                store,
-                runner,
-            )
-            _projects[configured.project] = runtime
-        _validate_unique_job_ids(_projects)
-        for runtime in _projects.values():
-            _recover_stale_jobs(runtime)
+        _runtime.configure_projects(load_server_config(), stage_queues)
 
-        default_runtime = _projects[_default_project]
-        _config_path = default_runtime.config_path
-        _config = default_runtime.config
-        _store = default_runtime.store
-        _runner = default_runtime.runner
+    _runtime.queue_wake = asyncio.Event()
+    _runtime.queue_worker_task = asyncio.create_task(_queue_worker())
 
-    app.state.queue_wake = asyncio.Event()
-    _queue_worker_task = asyncio.create_task(_queue_worker())
-
-    if _lan_mode_active and not allowed_repos:
+    if _runtime.lan_mode and not allowed_repos:
         log.warning(
             "LAN mode accepts arbitrary repositories on managed state %s; "
             "configure --allow-repo for a repository boundary",
-            _lan_state_dir,
+            _runtime.lan_state_dir,
         )
-    elif _lan_mode_active:
+    elif _runtime.lan_mode:
         log.info(
             "Constrained LAN mode enabled on %s with %s allowlisted repository(s)",
-            _lan_state_dir,
+            _runtime.lan_state_dir,
             len(allowed_repos),
         )
     else:
         log.info(
             "Training server ready. Projects: %s  default=%s  max_concurrent_jobs=%s",
-            sorted(_projects),
-            _default_project,
-            _server_config.max_concurrent_jobs,
+            sorted(_runtime.projects),
+            _runtime.default_project,
+            _runtime.max_concurrent_jobs,
         )
     yield
     log.info("Training server shutting down.")
-    if _queue_worker_task:
-        _queue_worker_task.cancel()
+    if _runtime.queue_worker_task:
+        _runtime.queue_worker_task.cancel()
         try:
-            await _queue_worker_task
+            await _runtime.queue_worker_task
         except asyncio.CancelledError:
+            # Cancellation is the expected queue-worker shutdown signal.
             pass
     # Cancel any running training tasks
-    tasks = list(_running_tasks.items())
+    tasks = list(_runtime.running_tasks.items())
     for jid, task in tasks:
-        found = _find_job_runtime(jid)
+        found = _runtime.find_job(jid)
         if found:
             await found[0].runner.cancel_job(jid)
         task.cancel()
     if tasks:
         await asyncio.gather(*(task for _, task in tasks), return_exceptions=True)
-    _running_tasks.clear()
-    app.state.queue_wake = None
-    _projects = {}
-    _server_config = None
-    _default_project = None
-    _lan_mode_active = False
-    _lan_state_dir = None
-    _lan_prepare_lock = None
-    _stage_queues = None
+    _runtime.reset()
 
 
 app = FastAPI(title="trainerd", version=__version__, lifespan=_lifespan)
 
 
-def _wake_queue() -> None:
-    """Notify the scheduler that pending work or available capacity changed."""
-    wake = getattr(app.state, "queue_wake", None)
-    if wake is not None:
-        wake.set()
-
-
-async def _wait_for_queue() -> None:
-    wake = getattr(app.state, "queue_wake", None)
-    if wake is None:
-        await asyncio.sleep(_queue_poll_interval)
-        return
-    try:
-        await asyncio.wait_for(wake.wait(), timeout=_queue_poll_interval)
-    except asyncio.TimeoutError:
-        pass
-    wake.clear()
-
-
-def _refresh_runtime_config() -> TrainingConfig:
-    global _config, _runner
-    runtime = _default_runtime()
-    _config = _refresh_project_runtime(runtime)
-    _runner = runtime.runner
-    return _config
-
-
 @app.get("/api/health")
 async def health() -> dict:
-    runtimes = _runtime_map()
+    runtimes = _runtime.projects
     for runtime in runtimes.values():
-        _refresh_project_runtime(runtime)
+        _runtime.refresh(runtime)
     pending = sum(len(runtime.store.list_job_ids(status=JobStatus.PENDING)) for runtime in runtimes.values())
     running = sum(len(runtime.store.list_job_ids(status=JobStatus.RUNNING)) for runtime in runtimes.values())
-    active = len(set().union(*_active_job_ids_by_project(runtimes).values()))
-    max_jobs = _daemon_max_concurrent_jobs()
-    default = _default_project or (_config.project if _config else None)
+    active = len(set().union(*_runtime.active_job_ids(runtimes).values()))
+    max_jobs = _runtime.max_concurrent_jobs
+    default = _runtime.default_project
     return {
         "status": "ok",
         "version": __version__,
@@ -617,18 +359,26 @@ async def health() -> dict:
         "project": default,
         "projects": sorted(runtimes),
         "default_project": default,
-        "mode": "lan" if _is_lan_mode() else "registry" if _is_registry_mode() else "single",
+        "mode": _runtime.mode,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "pending_jobs": pending,
         "running_jobs": running,
         "max_concurrent_jobs": max_jobs,
         "queue_capacity": max(max_jobs - active, 0),
-        "stage_queues": _stage_queues.snapshot() if _stage_queues else None,
+        "stage_queues": _runtime.stage_queues.snapshot() if _runtime.stage_queues else None,
         "authentication_required": bool(_configured_api_key()),
         "allowed_repository_count": (
-            len(_lan_allowed_repo_urls()) if _is_lan_mode() else None
+            len(_lan_allowed_repo_urls()) if _runtime.lan_mode else None
         ),
     }
+
+
+@app.get("/api/lan/config", dependencies=[Depends(_required_api_key_auth)])
+async def lan_config() -> dict:
+    """List normalized LAN repositories and task sources without executable fields."""
+    if not _runtime.lan_mode:
+        raise HTTPException(status_code=404, detail="LAN configuration is not active")
+    return _runtime.lan_config_view()
 
 
 @app.post("/api/jobs", dependencies=[Depends(_api_key_auth)])
@@ -646,8 +396,8 @@ async def submit_job(body: JobRequest = JobRequest()) -> dict:
     """
     payload = body.model_dump(exclude_none=True)
     _validate_multi_project_request(payload)
-    if _is_lan_mode():
-        lock = _lan_prepare_lock
+    if _runtime.lan_mode:
+        lock = _runtime.lan_prepare_lock
         if lock is None:
             raise HTTPException(status_code=503, detail="LAN checkout manager is not initialized")
         async with lock:
@@ -660,7 +410,7 @@ async def submit_job(body: JobRequest = JobRequest()) -> dict:
 
 def _queue_job(runtime: ProjectRuntime, payload: dict[str, Any]) -> dict:
     """Validate and persist one job against its selected runtime."""
-    config = _refresh_project_runtime(runtime)
+    config = _runtime.refresh(runtime)
     store = runtime.store
     requested_steps = payload.get("steps")
     configured_step_ids = [s.id for s in config.steps]
@@ -673,11 +423,11 @@ def _queue_job(runtime: ProjectRuntime, payload: dict[str, Any]) -> dict:
             raise HTTPException(status_code=400, detail="No valid step ids requested")
     else:
         steps = configured_step_ids
-    if _stage_queues:
+    if _runtime.stage_queues:
         try:
             for step in config.steps:
                 if step.id in steps and step.queue:
-                    _stage_queues.validate(step.queue, step.units)
+                    _runtime.stage_queues.validate(step.queue, step.units)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     version = _normalize_version(payload.get("version")) or _next_version(config)
@@ -698,7 +448,7 @@ def _queue_job(runtime: ProjectRuntime, payload: dict[str, Any]) -> dict:
             )
 
     job_id = str(uuid.uuid4())[:8]
-    while _find_job_runtime(job_id) is not None:
+    while _runtime.find_job(job_id) is not None:
         job_id = str(uuid.uuid4())[:8]
     job = store.create_job(
         job_id,
@@ -714,7 +464,7 @@ def _queue_job(runtime: ProjectRuntime, payload: dict[str, Any]) -> dict:
         else None,
         stage_units={step.id: step.units for step in config.steps if step.id in steps},
     )
-    _wake_queue()
+    _runtime.wake_queue()
     log.info(
         "Job %s queued: project=%s steps=%s version=%s force=%s",
         job_id,
@@ -755,9 +505,9 @@ async def _prepare_lan_runtime(
     if task is None:
         raise HTTPException(status_code=400, detail="task is required in LAN mode")
     version = payload.get("version")
-    if version is not None and not _SAFE_JOB_TOKEN.fullmatch(version):
+    if version is not None and not is_safe_identifier(version):
         raise HTTPException(status_code=400, detail="version contains unsupported characters")
-    if _lan_state_dir is None:
+    if _runtime.lan_state_dir is None:
         raise HTTPException(status_code=503, detail="LAN state is not initialized")
 
     try:
@@ -768,16 +518,24 @@ async def _prepare_lan_runtime(
                 status_code=403,
                 detail="Repository is not allowlisted on this trainerd host",
             )
+        policy = _runtime.lan_repositories.get(normalized_repo)
         prepared = await asyncio.to_thread(
             prepare_lan_project,
-            _lan_state_dir,
+            _runtime.lan_state_dir,
             normalized_repo,
             task,
             branch=payload.get("branch"),
+            task_definitions=policy.tasks if policy else None,
         )
     except LanConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    runtime = _install_lan_runtime(prepared)
+    try:
+        runtime = _runtime.install_lan(prepared)
+    except RepositoryCapacityError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="This repository has reached its configured concurrent job limit",
+        ) from exc
 
     sanitized = {
         key: value
@@ -789,88 +547,16 @@ async def _prepare_lan_runtime(
     return runtime, sanitized
 
 
-def _install_lan_runtime(prepared: LanPreparedProject) -> ProjectRuntime:
-    """Install or refresh a fully prepared dynamic runtime."""
-    repository_load = sum(
-        _lan_runtime_load(runtime)
-        for runtime in _projects.values()
-        if runtime.lan_repo_key == prepared.repo_key
-    )
-    if repository_load >= prepared.config.max_concurrent_jobs:
-        raise HTTPException(
-            status_code=409,
-            detail="This repository has reached its configured concurrent job limit",
-        )
-
-    existing = _projects.get(prepared.project)
-    if existing is not None:
-        existing.config = prepared.config
-        existing.runner.update_config(prepared.config)
-        return existing
-
-    store = JobStore(prepared.config.log_dir / "jobs.db")
-    workspace_lock = next(
-        (
-            runtime.workspace_lock
-            for runtime in _projects.values()
-            if runtime.lan_repo_key == prepared.repo_key
-            and runtime.workspace_lock is not None
-        ),
-        None,
-    ) or asyncio.Lock()
-    runner = JobRunner(
-        store,
-        prepared.config,
-        queues=_stage_queues,
-        workspace_lock=workspace_lock,
-    )
-    runtime = ProjectRuntime(
-        prepared.project,
-        None,
-        prepared.config,
-        store,
-        runner,
-        lan_repo_key=prepared.repo_key,
-        workspace_lock=workspace_lock,
-    )
-    _recover_stale_jobs(runtime)
-    if repository_load + _lan_runtime_load(runtime) >= prepared.config.max_concurrent_jobs:
-        raise HTTPException(
-            status_code=409,
-            detail="This repository has reached its configured concurrent job limit",
-        )
-    for job_id in store.list_job_ids():
-        found = _find_job_runtime(job_id)
-        if found is not None:
-            raise RuntimeError(f"Duplicate historical job id {job_id!r} in LAN state")
-    _projects[prepared.project] = runtime
-    global _default_project, _store, _runner, _config, _config_path
-    if _default_project is None:
-        _default_project = prepared.project
-        _store = store
-        _runner = runner
-        _config = prepared.config
-        _config_path = None
-    return runtime
-
-
-def _lan_runtime_load(runtime: ProjectRuntime) -> int:
-    """Count repository slots held by queued, running, or validating jobs."""
-    pending = set(runtime.store.list_job_ids(status=JobStatus.PENDING))
-    active = _active_job_ids_by_project({runtime.project: runtime})[runtime.project]
-    return len(pending | active)
-
-
 @app.get("/api/jobs", dependencies=[Depends(_read_api_key_auth)])
 async def list_jobs(limit: int = 20) -> list[dict]:
     jobs = [
         _with_project(runtime, job)
-        for runtime in _runtime_map().values()
+        for runtime in _runtime.projects.values()
         for job in runtime.store.list_jobs(limit=limit)
     ]
     jobs.extend(
         {**job, "project": project}
-        for project, store, _ in _persisted_lan_stores()
+        for project, store, _ in _runtime.persisted_lan_stores()
         for job in store.list_jobs(limit=limit)
     )
     return sorted(jobs, key=lambda job: job.get("created_at") or "", reverse=True)[:limit]
@@ -916,31 +602,6 @@ def _job_queue_entry(project: str, job: dict) -> dict:
     }
 
 
-def _scheduler_pending_order() -> list[tuple[ProjectRuntime, dict]]:
-    """Order pending jobs exactly as the queue worker would claim them.
-
-    Jobs the worker can claim right now come first, in global scheduler order
-    (per-project concurrency limits applied). Jobs blocked behind a saturated
-    project follow by age. This keeps queue_position consistent with dispatch
-    order instead of a naive global created_at sort.
-    """
-    runtimes = _runtime_map()
-    claimable = _pending_candidates(_daemon_max_concurrent_jobs())
-    claimable_ids = {(runtime.project, job["job_id"]) for runtime, job in claimable}
-    ordered = list(claimable)
-    deferred: list[tuple[str, ProjectRuntime, dict]] = []
-    for runtime in runtimes.values():
-        for job in runtime.store.list_jobs(
-            status=JobStatus.PENDING, limit=None, oldest_first=True
-        ):
-            if (runtime.project, job["job_id"]) in claimable_ids:
-                continue
-            deferred.append((job.get("created_at") or "", runtime, job))
-    deferred.sort(key=lambda item: item[0])
-    ordered.extend((runtime, job) for _, runtime, job in deferred)
-    return ordered
-
-
 def _active_queue_entries() -> tuple[list[dict], list[dict]]:
     """Return (running, pending) entries matching health counts.
 
@@ -948,7 +609,7 @@ def _active_queue_entries() -> tuple[list[dict], list[dict]]:
     still marked pending or running there is stale, so counting it would make
     the queue disagree with /api/health.
     """
-    runtimes = _runtime_map()
+    runtimes = _runtime.projects
     running: list[dict] = []
     for runtime in runtimes.values():
         for job in runtime.store.list_jobs(
@@ -958,7 +619,7 @@ def _active_queue_entries() -> tuple[list[dict], list[dict]]:
     running.sort(key=lambda entry: entry.get("started_at") or entry.get("created_at") or "")
     pending = [
         _job_queue_entry(runtime.project, job)
-        for runtime, job in _scheduler_pending_order()
+        for runtime, job in _runtime.pending_order()
     ]
     for position, entry in enumerate(pending, start=1):
         entry["queue_position"] = position
@@ -973,39 +634,39 @@ async def active_queue() -> dict:
     in scheduler order. Each entry exposes only identifiers, status, stage/queue
     position, and times - never commands, environment values, or secrets.
     """
-    runtimes = _runtime_map()
+    runtimes = _runtime.projects
     for runtime in runtimes.values():
-        _refresh_project_runtime(runtime)
+        _runtime.refresh(runtime)
     running, pending = _active_queue_entries()
-    active = len(set().union(*_active_job_ids_by_project(runtimes).values()))
-    max_jobs = _daemon_max_concurrent_jobs()
+    active = len(set().union(*_runtime.active_job_ids(runtimes).values()))
+    max_jobs = _runtime.max_concurrent_jobs
     return {
         "jobs": running + pending,
         "pending_jobs": len(pending),
         "running_jobs": len(running),
         "max_concurrent_jobs": max_jobs,
         "queue_capacity": max(max_jobs - active, 0),
-        "stage_queues": _stage_queues.snapshot() if _stage_queues else None,
+        "stage_queues": _runtime.stage_queues.snapshot() if _runtime.stage_queues else None,
         "authentication_required": bool(_configured_api_key()),
     }
 
 
 @app.get("/api/jobs/{job_id}", dependencies=[Depends(_read_api_key_auth)])
 async def get_job(job_id: str) -> dict:
-    found = _find_job_runtime(job_id)
+    found = _runtime.find_job(job_id)
     if found:
         runtime, job = found
         return {
             **_with_project(runtime, job),
-            "stage_queues": _stage_queues.snapshot() if _stage_queues else None,
+            "stage_queues": _runtime.stage_queues.snapshot() if _runtime.stage_queues else None,
         }
-    persisted = _find_persisted_lan_job(job_id)
+    persisted = _runtime.find_persisted_lan_job(job_id)
     if persisted:
         project, _, _, job = persisted
         return {
             **job,
             "project": project,
-            "stage_queues": _stage_queues.snapshot() if _stage_queues else None,
+            "stage_queues": _runtime.stage_queues.snapshot() if _runtime.stage_queues else None,
         }
     raise HTTPException(status_code=404, detail="Job not found")
 
@@ -1013,12 +674,12 @@ async def get_job(job_id: str) -> dict:
 @app.get("/api/jobs/{job_id}/logs", dependencies=[Depends(_read_api_key_auth)])
 async def stream_logs(job_id: str, request: Request, tail: int | None = None) -> Response:
     """Stream job logs as plain text. Accepts ?tail=N to return last N lines."""
-    found = _find_job_runtime(job_id)
+    found = _runtime.find_job(job_id)
     if found:
         runtime, _ = found
         store = runtime.store
         log_dir = runtime.config.log_dir
-    elif persisted := _find_persisted_lan_job(job_id):
+    elif persisted := _runtime.find_persisted_lan_job(job_id):
         _, store, log_dir, _ = persisted
     else:
         return PlainTextResponse("Log not available yet.\n", status_code=404)
@@ -1040,9 +701,7 @@ async def stream_logs(job_id: str, request: Request, tail: int | None = None) ->
                 if chunk:
                     yield chunk
                 else:
-                    if store.get_job(job_id, field="status") in (
-                        JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.PROMOTED
-                    ):
+                    if JobStatus.is_terminal(store.get_job(job_id, field="status")):
                         break
                     await asyncio.sleep(0.5)
                     if await request.is_disconnected():
@@ -1053,12 +712,12 @@ async def stream_logs(job_id: str, request: Request, tail: int | None = None) ->
 
 def _find_job_artifact_context(job_id: str) -> tuple[Path, dict] | None:
     """Return the daemon-owned work directory and job, including after restart."""
-    found = _find_job_runtime(job_id)
+    found = _runtime.find_job(job_id)
     if found:
         runtime, job = found
         return runtime.config.work_dir, job
-    persisted = _find_persisted_lan_job(job_id)
-    if not persisted or _lan_state_dir is None:
+    persisted = _runtime.find_persisted_lan_job(job_id)
+    if not persisted or _runtime.lan_state_dir is None:
         return None
     project, _, _, job = persisted
     match = re.fullmatch(
@@ -1067,7 +726,7 @@ def _find_job_artifact_context(job_id: str) -> tuple[Path, dict] | None:
     )
     if not match:
         return None
-    return _lan_state_dir / "work" / match[1] / match[2], job
+    return _runtime.lan_state_dir / "work" / match[1] / match[2], job
 
 
 def _validated_job_artifacts(
@@ -1178,21 +837,21 @@ async def cancel_job(job_id: str) -> dict:
     Pending jobs are marked failed and will never start.
     Running jobs are terminated (subprocess killed) if possible.
     """
-    found = _find_job_runtime(job_id)
+    found = _runtime.find_job(job_id)
     if not found:
         raise HTTPException(status_code=404, detail="Job not found")
     runtime, job = found
-    if job["status"] in (JobStatus.PROMOTED, JobStatus.FAILED):
+    if JobStatus.is_terminal(job["status"]):
         raise HTTPException(status_code=400, detail=f"Job already terminal: {job['status']}")
 
     if job["status"] == JobStatus.PENDING:
         # A freshly claimed task may still have a pending DB row. Cancel that
         # reservation as well so it cannot start after this response.
-        task = _running_tasks.pop(job_id, None)
+        task = _runtime.running_tasks.pop(job_id, None)
         if task is not None:
             task.cancel()
         runtime.store.set_failed(job_id, "Cancelled via API")
-        _wake_queue()
+        _runtime.wake_queue()
         log.info("Pending job %s cancelled", job_id)
         return {
             "job_id": job_id,
@@ -1203,7 +862,7 @@ async def cancel_job(job_id: str) -> dict:
 
     # Running — kill subprocess and cancel task
     killed = await runtime.runner.cancel_job(job_id)
-    task = _running_tasks.pop(job_id, None)
+    task = _runtime.running_tasks.pop(job_id, None)
     if task is not None:
         task.cancel()
     runtime.store.set_failed(job_id, "Cancelled via API" + ("" if killed else " (subprocess could not be terminated)"))
@@ -1220,7 +879,7 @@ async def cancel_job(job_id: str) -> dict:
 @app.post("/api/jobs/{job_id}/promote", dependencies=[Depends(_api_key_auth)])
 async def promote_job(job_id: str) -> dict:
     """Manually promote a validated job's models to git."""
-    found = _find_job_runtime(job_id)
+    found = _runtime.find_job(job_id)
     if not found:
         raise HTTPException(status_code=404, detail="Job not found")
     runtime, job = found
@@ -1285,17 +944,20 @@ def main(
     cpu_concurrency: int | None = None,
     gpu_capacity: int | None = None,
     allowed_repos: list[str] | None = None,
+    lan_config: str | None = None,
 ) -> None:
     if not lan and (
         state_dir is not None
         or max_concurrent_jobs is not None
         or allowed_repos is not None
+        or lan_config is not None
     ):
         raise ValueError(
-            "--state-dir, --max-concurrent-jobs, and --allow-repo require --lan"
+            "--state-dir, --max-concurrent-jobs, --allow-repo, and --lan-config require --lan"
         )
     if not lan:
         os.environ.pop(_LAN_ALLOWED_REPOS_ENV, None)
+        _runtime.lan_config_path = None
     if cpu_concurrency is not None:
         if not 1 <= cpu_concurrency <= 64:
             raise ValueError("--cpu-concurrency must be from 1 to 64")
@@ -1319,10 +981,18 @@ def main(
         else:
             os.environ.pop("TRAINERD_MAX_CONCURRENT_JOBS", None)
         if allowed_repos:
+            if lan_config:
+                raise ValueError("Use --lan-config or --allow-repo, not both")
             os.environ[_LAN_ALLOWED_REPOS_ENV] = "\n".join(
                 normalize_repo_url(value) for value in allowed_repos
             )
-        _validate_lan_security()
+        else:
+            os.environ.pop(_LAN_ALLOWED_REPOS_ENV, None)
+        if lan_config:
+            _runtime.lan_config_path = Path(lan_config).expanduser().resolve()
+        else:
+            _runtime.lan_config_path = None
+        _validate_lan_security(frozenset(_load_lan_repositories()))
         server_port = 7860
     elif projects_config:
         os.environ.pop("TRAINERD_LAN_MODE", None)

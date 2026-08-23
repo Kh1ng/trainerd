@@ -12,7 +12,6 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _MAX_ENV_VARS = 128
 _MAX_VALUE_BYTES = 16_384
@@ -97,24 +96,26 @@ def _write_managed_env(state_dir: Path, values: dict[str, str]) -> None:
     )
     temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as env_file:
             json.dump(
                 {"version": _SCHEMA_VERSION, "env": values},
-                handle,
+                env_file,
                 indent=2,
                 sort_keys=True,
             )
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+            env_file.write("\n")
+            env_file.flush()
+            os.fsync(env_file.fileno())
         try:
             temporary.chmod(0o600)
         except OSError:
+            # Windows ACLs do not implement POSIX mode bits.
             pass
         os.replace(temporary, target)
         try:
             target.chmod(0o600)
         except OSError:
+            # Windows ACLs do not implement POSIX mode bits.
             pass
     finally:
         temporary.unlink(missing_ok=True)

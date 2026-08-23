@@ -6,11 +6,11 @@ provide commands or filesystem paths.
 """
 from __future__ import annotations
 
+import copy
 import errno
 import getpass
 import hashlib
 import os
-import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -26,13 +26,13 @@ from .config import (
     TrainingConfig,
     ValidationConfig,
 )
+from .contracts import is_safe_identifier
 from .managed_env import ManagedEnvError, load_managed_env, validate_env_name
 
-_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _MAX_REPO_URL = 2048
 _MAX_COMMAND = 16_384
 _MAX_STRING = 1024
+_MAX_TASKS = 64
 _MAX_STEPS = 64
 _GIT_TIMEOUT_SECONDS = 300
 
@@ -51,6 +51,63 @@ class LanPreparedProject:
     manifest_path: Path
     revision: str
     config: TrainingConfig
+
+
+@dataclass(frozen=True)
+class LanRepositoryPolicy:
+    """One normalized LAN repository and optional server-owned tasks."""
+
+    repo_url: str
+    tasks: dict[str, dict[str, Any]] | None
+
+
+def load_lan_server_config(path: Path) -> dict[str, LanRepositoryPolicy]:
+    """Load and validate the persistent server-owned LAN repository policy."""
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError, UnicodeDecodeError) as exc:
+        raise LanConfigError(f"Could not read LAN config: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise LanConfigError("LAN config must be a mapping")
+    _only_keys(raw, {"version", "repositories"}, "LAN config")
+    if raw.get("version") != 1:
+        raise LanConfigError("LAN config version must be 1")
+    entries = raw.get("repositories")
+    if not isinstance(entries, list) or not entries or len(entries) > 256:
+        raise LanConfigError("LAN config requires 1-256 repository entries")
+
+    repositories: dict[str, LanRepositoryPolicy] = {}
+    for index, entry in enumerate(entries):
+        label = f"LAN config repository {index}"
+        if not isinstance(entry, dict):
+            raise LanConfigError(f"{label} must be a mapping")
+        _only_keys(entry, {"repo", "tasks"}, label)
+        repo_url = normalize_repo_url(entry.get("repo"))
+        if repo_url in repositories:
+            raise LanConfigError(f"Duplicate normalized repository: {repo_url}")
+        tasks = entry.get("tasks")
+        if tasks is not None:
+            if not isinstance(tasks, dict) or not tasks or len(tasks) > _MAX_TASKS:
+                raise LanConfigError(
+                    f"{label} tasks must be a mapping of 1-{_MAX_TASKS} tasks"
+                )
+            for task in tasks:
+                _load_lan_task_definitions(
+                    tasks,
+                    task=str(task),
+                    project=f"lan-{'0' * 20}-{task}",
+                    repo_url=repo_url,
+                    repo_path=Path("/trainerd/repo"),
+                    branch="main",
+                    work_dir=Path("/trainerd/work"),
+                    log_dir=Path("/trainerd/logs"),
+                    source="server_config",
+                )
+        repositories[repo_url] = LanRepositoryPolicy(
+            repo_url,
+            copy.deepcopy(tasks) if tasks is not None else None,
+        )
+    return repositories
 
 
 def default_state_dir() -> Path:
@@ -122,6 +179,7 @@ def prepare_lan_project(
     task: str,
     *,
     branch: str | None = None,
+    task_definitions: dict[str, dict[str, Any]] | None = None,
 ) -> LanPreparedProject:
     """Clone/update a managed checkout and load one task from `.trainerd.yaml`."""
     normalized_url = normalize_repo_url(repo_url)
@@ -160,24 +218,37 @@ def prepare_lan_project(
     if not revision:
         raise LanConfigError("Managed checkout has no Git revision")
     resolved_manifest = manifest.resolve()
-    if not manifest.is_file() or not _within(resolved_manifest, checkout.resolve()):
-        raise LanConfigError("Repository root must contain a regular .trainerd.yaml file")
 
     project = f"lan-{key}-{task}"
     work_dir = state_dir / "work" / key / task
     log_dir = state_dir / "jobs" / project
     work_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
-    config = load_lan_task(
-        resolved_manifest,
-        task=task,
-        project=project,
-        repo_url=normalized_url,
-        repo_path=checkout,
-        branch=selected_branch,
-        work_dir=work_dir,
-        log_dir=log_dir,
-    )
+    if task_definitions is None:
+        if not manifest.is_file() or not _within(resolved_manifest, checkout.resolve()):
+            raise LanConfigError("Repository root must contain a regular .trainerd.yaml file")
+        config = load_lan_task(
+            resolved_manifest,
+            task=task,
+            project=project,
+            repo_url=normalized_url,
+            repo_path=checkout,
+            branch=selected_branch,
+            work_dir=work_dir,
+            log_dir=log_dir,
+        )
+    else:
+        config = _load_lan_task_definitions(
+            task_definitions,
+            task=task,
+            project=project,
+            repo_url=normalized_url,
+            repo_path=checkout,
+            branch=selected_branch,
+            work_dir=work_dir,
+            log_dir=log_dir,
+            source="server_config",
+        )
     inject_managed_env(config, state_dir)
     return LanPreparedProject(
         project=project,
@@ -228,16 +299,29 @@ def load_lan_job_config(
     state_dir = base_checkout.parent.parent
     if base_checkout != state_dir / "repos" / key:
         raise LanConfigError("Managed LAN checkout is outside the state repository directory")
-    config = load_lan_task(
-        checkout / ".trainerd.yaml",
-        task=task,
-        project=current.project,
-        repo_url=normalized_url,
-        repo_path=checkout,
-        branch=branch,
-        work_dir=current.work_dir,
-        log_dir=current.log_dir,
-    )
+    if current.lan_task_definition is None:
+        config = load_lan_task(
+            checkout / ".trainerd.yaml",
+            task=task,
+            project=current.project,
+            repo_url=normalized_url,
+            repo_path=checkout,
+            branch=branch,
+            work_dir=current.work_dir,
+            log_dir=current.log_dir,
+        )
+    else:
+        config = _load_lan_task_definitions(
+            {task: current.lan_task_definition},
+            task=task,
+            project=current.project,
+            repo_url=normalized_url,
+            repo_path=checkout,
+            branch=branch,
+            work_dir=current.work_dir,
+            log_dir=current.log_dir,
+            source="server_config",
+        )
     inject_managed_env(config, state_dir)
     return config
 
@@ -264,8 +348,34 @@ def load_lan_task(
     if raw.get("version") != 1:
         raise LanConfigError(".trainerd.yaml version must be 1")
     tasks = raw.get("tasks")
+    return _load_lan_task_definitions(
+        tasks,
+        task=task,
+        project=project,
+        repo_url=repo_url,
+        repo_path=repo_path,
+        branch=branch,
+        work_dir=work_dir,
+        log_dir=log_dir,
+        source="repository_manifest",
+    )
+
+
+def _load_lan_task_definitions(
+    tasks: Any,
+    *,
+    task: str,
+    project: str,
+    repo_url: str,
+    repo_path: Path,
+    branch: str,
+    work_dir: Path,
+    log_dir: Path,
+    source: str,
+) -> TrainingConfig:
+    """Build one bounded LAN task from repository- or server-owned definitions."""
     if not isinstance(tasks, dict) or not tasks:
-        raise LanConfigError(".trainerd.yaml requires a non-empty tasks mapping")
+        raise LanConfigError(f"{source} requires a non-empty tasks mapping")
     for task_id in tasks:
         _safe_id(task_id, "task id")
     if task not in tasks:
@@ -350,6 +460,8 @@ def load_lan_task(
         log_dir=log_dir.resolve(),
         max_concurrent_jobs=max_jobs,
         required_env=tuple(required_env),
+        lan_task_source=source,
+        lan_task_definition=copy.deepcopy(task_raw) if source == "server_config" else None,
     )
 
 
@@ -411,8 +523,12 @@ def _safe_env(value: Any, label: str) -> dict[str, str]:
         raise LanConfigError(f"{label} env supports at most 64 variables")
     result: dict[str, str] = {}
     for name, raw_value in value.items():
-        if not isinstance(name, str) or not _ENV_NAME.fullmatch(name):
-            raise LanConfigError(f"{label} contains an invalid environment variable name")
+        try:
+            validate_env_name(name)
+        except ManagedEnvError as exc:
+            raise LanConfigError(
+                f"{label} contains an invalid environment variable name"
+            ) from exc
         result[name] = _bounded_string(raw_value, f"{label} env {name}", 4096, allow_empty=True)
     return result
 
@@ -499,6 +615,7 @@ def _probe_writable_dir(path: Path) -> bool:
     try:
         probe.close()
     except OSError:
+        # Creation proved writability; close cleanup can fail independently.
         pass
     return True
 
@@ -539,7 +656,7 @@ def _only_keys(value: dict[Any, Any], allowed: set[str], label: str) -> None:
 
 
 def _safe_id(value: Any, label: str) -> str:
-    if not isinstance(value, str) or not _SAFE_ID.fullmatch(value):
+    if not is_safe_identifier(value):
         raise LanConfigError(f"{label} must be a safe identifier (letters, numbers, ., _, -)")
     return value
 

@@ -51,6 +51,49 @@ set. Submitting, cancelling, and promoting jobs require `X-API-Key`. Health,
 job status, logs, and model metadata remain readable on the trusted LAN, and
 persisted job status and logs remain readable after daemon restarts.
 
+Use one server-owned file when the repository list must persist. The file can
+also contain tasks that do not belong in a repository:
+
+```yaml
+version: 1
+repositories:
+  - repo: http://git.local/Khing/manifest-owned.git
+  - repo: http://git.local/Khing/server-owned.git
+    tasks:
+      nfl-train:
+        required_env:
+          - NFL_DATABASE_URL
+        max_concurrent_jobs: 2
+        steps:
+          - id: prepare
+            cmd: 'py -3.12 -u scripts/prepare.py --work-dir "{work_dir}"'
+            cwd: "."
+            queue: cpu
+          - id: train
+            cmd: 'py -3.12 -u scripts/train.py --work-dir "{work_dir}"'
+            cwd: "."
+            queue: gpu
+```
+
+The first entry loads tasks from `.trainerd.yaml`. The second entry uses only
+the tasks in the server file. Start the daemon with this file:
+
+```powershell
+$env:TRAINERD_API_KEY = "replace-with-a-long-random-secret"
+trainerd serve --lan `
+  --lan-config C:\ProgramData\trainerd\lan.yaml
+```
+
+Startup rejects invalid entries and duplicate normalized URLs. Authenticated
+operators can inspect URLs and task sources without reading commands or
+environment values:
+
+```powershell
+Invoke-RestMethod `
+  -Uri http://127.0.0.1:7860/api/lan/config `
+  -Headers @{ "X-API-Key" = $env:TRAINERD_API_KEY }
+```
+
 It listens on `0.0.0.0:7860`. On Windows, managed checkouts and job state
 default to `%PROGRAMDATA%\trainerd\state`; `--state-dir` can override this.
 
@@ -222,6 +265,30 @@ Registry mode fails closed if an environment variable, API key, config path, or
 project identity is invalid. Each project must use a distinct `log_dir`, which
 owns that project's SQLite database and job logs.
 
+### Client profiles
+
+Store the server URL and project on each client. A profile never stores the API
+key, commands, or filesystem paths.
+
+On a Mac client, create a profile for the Windows worker:
+
+```bash
+trainerd profile set gpu \
+  --server-url http://training-node:7860 \
+  --project project-a
+export TRAINERD_API_KEY="$TRAINING_SERVER_API_KEY"
+trainerd submit --profile gpu --steps run --version v42 --wait --logs
+```
+
+`trainerd profile list` shows the saved defaults. `trainerd profile remove gpu`
+removes the profile. Explicit submit flags replace the saved defaults.
+
+Profiles are stored in `~/.config/trainerd/profiles.json` on macOS and Linux.
+Windows uses `%APPDATA%\trainerd\profiles.json`.
+
+Use a profile with registry mode when the worker owns commands and paths. Use
+LAN manifests only when the repository must own its task definitions.
+
 ## Submit work over HTTP
 
 The CLI reads `TRAINERD_API_KEY`, so the secret does not need to appear in the
@@ -287,6 +354,7 @@ must not exceed 2 GiB. Artifact endpoints are unavailable without an API key.
 | Endpoint | Authentication | Purpose |
 |---|---:|---|
 | `GET /api/health` | No | Version, allowlist, queue, and capacity |
+| `GET /api/lan/config` | API key required | Normalized LAN repositories and task sources |
 | `POST /api/jobs` | API key; none in LAN mode | Submit a job |
 | `GET /api/jobs` | API key; none in LAN mode | List recent jobs |
 | `GET /api/jobs/{job_id}` | API key; none in LAN mode | Read job status |
@@ -350,22 +418,31 @@ upgrade installs a new versioned daemon environment, validates it on an
 alternate port, then switches the service action; the old environment remains
 available for rollback.
 
-Upgrade the running daemon atomically with the bundled helper. It refuses to
-cut over while the queue has pending or running jobs, rechecks the queue
-immediately before the cutover, installs the candidate into a fresh versioned
-environment, probes it on an alternate port with a unique isolated LAN state
-directory, stops only the `trainerd-lan` task, switches the task action, and
-verifies health and version. If the switch or verification fails, it restores
-the prior action and rechecks health against the prior version:
+Upgrade the running daemon with the bundled helper. Give the helper the exact
+production arguments and isolated probe arguments. The probe must keep the same
+authentication and repository policy.
 
 ```powershell
 .\scripts\trainerd-upgrade.ps1 -Version 0.3.13 `
-  -WheelUrl https://github.com/Kh1ng/trainerd/releases/download/v0.3.13/trainerd-0.3.13-py3-none-any.whl
+  -WheelUrl https://github.com/Kh1ng/trainerd/releases/download/v0.3.13/trainerd-0.3.13-py3-none-any.whl `
+  -ServeArguments '--lan --lan-config "C:\ProgramData\trainerd\lan.yaml" --state-dir "C:\ProgramData\trainerd\state" --host 0.0.0.0 --port 7860' `
+  -ProbeArguments '--lan --lan-config "C:\ProgramData\trainerd\lan.yaml" --state-dir "{probe_state_dir}" --host 127.0.0.1 --port {probe_port}'
 ```
 
-The helper never kills unrelated Python processes and appends versioned startup
-logs instead of overwriting them. One stable Windows account should own the
-daemon state directory across upgrades.
+The probe arguments must contain `{probe_port}`. LAN probe arguments must also
+contain `{probe_state_dir}`. Use an isolated registry file for a registry-mode
+probe.
+
+The helper compares the mode, authentication requirement, repository count,
+and project list before cutover. It refuses to continue when one value differs.
+
+The helper first stops the Scheduled Task. If its PowerShell child remains, the
+helper can stop only the process that owns the Trainerd port. The process must
+also match the prior version, an empty queue, and a `trainerd serve` command
+line. The helper does not stop a process that fails one of these checks.
+
+If the switch fails, the helper restores the prior task action. It also checks
+the prior version after rollback. Versioned startup logs use append mode.
 
 ## Legacy single-project mode
 
