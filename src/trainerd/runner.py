@@ -474,15 +474,18 @@ def _config_for_job(
     base_work = str(config.work_dir.resolve())
     job_work = str(work_dir.resolve())
     repo_marker = "\0trainerd-repo\0"
+    work_marker = "\0trainerd-work\0"
 
     def bind(value: str | None) -> str | None:
         if value is None:
             return None
-        return (
-            value.replace(base_repo, repo_marker)
-            .replace(base_work, job_work)
-            .replace(repo_marker, base_repo)
-        )
+        for source, marker in sorted(
+            ((base_repo, repo_marker), (base_work, work_marker)),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        ):
+            value = value.replace(source, marker)
+        return value.replace(repo_marker, base_repo).replace(work_marker, job_work)
 
     steps = [
         replace(
