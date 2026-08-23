@@ -1,10 +1,10 @@
-"""Static safety regression for the Windows upgrade launcher.
+"""Static safety regression for the Windows upgrade helper.
 
 The PowerShell helper runs only on Windows and can cut over the production
 Scheduled Task. These tests pin its safety invariants so a future edit cannot
 silently reintroduce the failure modes from #18: killing unrelated Python
-processes, overwriting startup logs, cutting over with a busy queue, deleting
-the live state directory, or skipping the restore-on-failure path.
+processes, cutting over with a busy queue, deleting the live state directory,
+or skipping the restore-on-failure path.
 """
 from __future__ import annotations
 
@@ -82,7 +82,7 @@ def test_upgrade_script_requires_explicit_live_and_probe_arguments() -> None:
     assert "[string]$ServeArguments" in text
     assert "[string]$ProbeArguments" in text
     assert '-ArgumentList "-m trainerd serve $probeArgumentsResolved"' in text
-    assert 'serve $ServeArguments *>> "$startupLog"' in text
+    assert '-Argument "serve $ServeArguments"' in text
     assert 'ProbeArguments must contain {probe_port}' in text
     assert 'LAN ProbeArguments must contain {probe_state_dir}' in text
 
@@ -93,19 +93,27 @@ def test_upgrade_script_compares_live_and_candidate_policy() -> None:
     for field in (
         "mode",
         "authentication_required",
-        "allowed_repository_count",
-        "projects",
+        "lan_policy_hash",
     ):
         assert f'"{field}"' in text
+    policy_check = text.split("function Assert-SamePolicy", 1)[1].split(
+        "function Stop-VerifiedTrainerdListener", 1
+    )[0]
+    assert '"allowed_repository_count"' not in policy_check
+    assert '$Expected.mode -eq "lan"' in policy_check
+    assert '$fields += "projects"' in policy_check
     assert "Assert-SamePolicy -Expected $live -Candidate $candidateHealth" in text
     assert "Assert-SamePolicy -Expected $live -Candidate $installedHealth" in text
 
 
-def test_upgrade_script_builds_launcher_before_stopping_task() -> None:
+def test_upgrade_script_uses_direct_trainerd_scheduled_task_action() -> None:
     text = _script_text()
-    launcher_index = text.index("Out-File -FilePath $launcherPath")
+    action_index = text.index("New-ScheduledTaskAction -Execute $trainerdExe")
     stop_index = text.index("Stop-DaemonTask -ExpectedVersion $priorVersion")
-    assert launcher_index < stop_index
+    assert action_index < stop_index
+    assert '-Argument "serve $ServeArguments"' in text
+    assert "$launcherPath" not in text
+    assert '-Execute "powershell.exe"' not in text
 
 
 def test_upgrade_script_preserves_prior_action_and_restores_on_failure() -> None:
@@ -117,6 +125,14 @@ def test_upgrade_script_preserves_prior_action_and_restores_on_failure() -> None
     assert "function Restore-PriorAction" in text
     assert text.count("Restore-PriorAction -Execute") >= 2
     assert "Rollback failed" in text
+
+
+def test_upgrade_script_restores_action_without_empty_working_directory() -> None:
+    restore = _script_text().split("function Restore-PriorAction", 1)[1].split(
+        "# 1.", 1
+    )[0]
+    assert "[string]::IsNullOrWhiteSpace($WorkingDirectory)" in restore
+    assert "New-ScheduledTaskAction @actionParameters" in restore
 
 
 def test_upgrade_script_rollback_verifies_prior_version() -> None:
@@ -146,14 +162,10 @@ def test_upgrade_script_preserves_caller_quoting_for_probe_state() -> None:
     )
 
 
-def test_upgrade_script_appends_versioned_startup_logs() -> None:
+def test_upgrade_script_keeps_distinct_versioned_probe_logs() -> None:
     text = _script_text()
-    assert "startup-$Version.log" in text
-    assert "*>>" in text
-    # The old launcher used Start-Process -RedirectStandardOutput which
-    # replaced the prior logs. The task launcher body must append instead.
-    assert "RedirectStandardOutput" in text  # probe log only
-    assert '*>> "$startupLog"' in text
+    assert "probe-$Version.stdout.log" in text
+    assert "probe-$Version.stderr.log" in text
 
 
 def test_upgrade_script_verifies_health_and_version_after_switch() -> None:

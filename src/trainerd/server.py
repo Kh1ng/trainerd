@@ -375,6 +375,7 @@ async def health() -> dict:
         "allowed_repository_count": (
             len(_lan_allowed_repo_urls()) if _runtime.lan_mode else None
         ),
+        "lan_policy_hash": _runtime.lan_policy_hash() if _runtime.lan_mode else None,
     }
 
 

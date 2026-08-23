@@ -23,6 +23,7 @@ from trainerd.config import StepConfig
 from trainerd.lan import (
     LanConfigError,
     LanPreparedProject,
+    LanRepositoryPolicy,
     _probe_appendable,
     _probe_writable_dir,
     _require_writable_checkout,
@@ -410,6 +411,9 @@ def test_authenticated_lan_config_view_omits_commands(tmp_path: Path, monkeypatc
     monkeypatch.setenv("TRAINERD_STATE_DIR", str(tmp_path / "state"))
     server._runtime.lan_config_path = path
     with TestClient(server.app) as client:
+        assert client.get("/api/health").json()["lan_policy_hash"] == (
+            server._runtime.lan_policy_hash()
+        )
         assert client.get("/api/lan/config").status_code == 401
         response = client.get(
             "/api/lan/config", headers={"X-API-Key": "secret"}
@@ -437,6 +441,36 @@ def test_authenticated_lan_config_view_omits_commands(tmp_path: Path, monkeypatc
             "/api/lan/config", headers={"X-API-Key": "secret"}
         )
         assert restarted.json() == response.json()
+
+
+def test_lan_policy_hash_tracks_policy_not_loaded_projects() -> None:
+    runtime = server.DaemonRuntime()
+    first_url = "http://git.local/team/first.git"
+    second_url = "http://git.local/team/second.git"
+    task = {"train": {"steps": [{"id": "run", "cmd": "train"}]}}
+    runtime.lan_repositories = {
+        first_url: LanRepositoryPolicy(first_url, task),
+    }
+    original = runtime.lan_policy_hash()
+
+    runtime.projects["loaded-history"] = object()  # type: ignore[assignment]
+    assert runtime.lan_policy_hash() == original
+
+    runtime.lan_repositories = {
+        second_url: LanRepositoryPolicy(second_url, task),
+    }
+    assert runtime.lan_policy_hash() != original
+
+    runtime.lan_repositories = {
+        first_url: LanRepositoryPolicy(first_url, None),
+    }
+    assert runtime.lan_policy_hash() != original
+
+    changed = {"train": {"steps": [{"id": "run", "cmd": "changed"}]}}
+    runtime.lan_repositories = {
+        first_url: LanRepositoryPolicy(first_url, changed),
+    }
+    assert runtime.lan_policy_hash() != original
 
 
 def test_server_owned_task_survives_pinned_checkout_reload(tmp_path: Path) -> None:

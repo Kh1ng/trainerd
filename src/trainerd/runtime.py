@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -100,6 +102,20 @@ class DaemonRuntime:
                 for repo_url, policy in sorted(self.lan_repositories.items())
             ]
         }
+
+    def lan_policy_hash(self) -> str:
+        """Identify the complete LAN repository policy without exposing it."""
+        policy = [
+            {"repo": repo_url, "tasks": repository.tasks}
+            for repo_url, repository in sorted(self.lan_repositories.items())
+        ]
+        encoded = json.dumps(
+            policy,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     def configure_projects(
         self,
