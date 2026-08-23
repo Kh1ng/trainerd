@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import sqlite3
 import stat
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,9 +22,13 @@ from trainerd.config import StepConfig
 from trainerd.lan import (
     LanConfigError,
     LanPreparedProject,
+    _probe_appendable,
+    _probe_writable_dir,
+    _require_writable_checkout,
     load_lan_task,
     normalize_branch,
     normalize_repo_url,
+    prepare_lan_project,
     repo_key,
 )
 from trainerd.storage import JobStore
@@ -373,7 +383,9 @@ def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
         # returns. Its task reservation must still block a checkout pull.
         runtime.store.set_completed(result["job_id"])
         server._running_tasks[result["job_id"]] = object()  # type: ignore[assignment]
-        with patch("trainerd.server.prepare_lan_project") as prepare_again:
+        with patch(
+            "trainerd.server.prepare_lan_project", return_value=prepared
+        ) as prepare_again:
             validating = client.post(
                 "/api/jobs",
                 json={
@@ -382,7 +394,7 @@ def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
                 },
             )
         assert validating.status_code == 409
-        prepare_again.assert_not_called()
+        prepare_again.assert_called_once()
         server._running_tasks.pop(result["job_id"], None)
 
         prepared.config.max_concurrent_jobs = 2
@@ -472,6 +484,83 @@ def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
         ) = old_state
 
 
+def test_lan_uses_new_task_limit_and_repository_workspace_locks(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TRAINERD_ALLOWED_REPOS", raising=False)
+    prepared = _prepared(tmp_path)
+    prepared.config.max_concurrent_jobs = 1
+    other_project = f"lan-{prepared.repo_key}-other"
+    other = replace(
+        prepared,
+        project=other_project,
+        task="other",
+        config=replace(
+            prepared.config,
+            project=other_project,
+            work_dir=tmp_path / "state" / "work" / prepared.repo_key / "other",
+            log_dir=tmp_path / "state" / "jobs" / other_project,
+            max_concurrent_jobs=2,
+        ),
+    )
+    third_key = "b" * 20
+    third_project = f"lan-{third_key}-other"
+    third = replace(
+        other,
+        project=third_project,
+        repo_key=third_key,
+        config=replace(
+            other.config,
+            project=third_project,
+            work_dir=tmp_path / "state" / "work" / third_key / "other",
+            log_dir=tmp_path / "state" / "jobs" / third_project,
+        ),
+    )
+    old_state = (
+        server._projects,
+        server._default_project,
+        server._store,
+        server._runner,
+        server._config,
+        server._config_path,
+        server._lan_mode_active,
+        server._lan_state_dir,
+    )
+    server._projects = {}
+    server._default_project = None
+    server._store = None
+    server._runner = None
+    server._config = None
+    server._config_path = None
+    server._lan_mode_active = True
+    server._lan_state_dir = tmp_path / "state"
+    try:
+        first = server._install_lan_runtime(prepared)
+        first.store.create_job("existing", ["train"], "v1")
+        with patch("trainerd.server.prepare_lan_project", return_value=other):
+            second, _ = asyncio.run(
+                server._prepare_lan_runtime(
+                    {"repo": prepared.repo_url, "task": "other"}
+                )
+            )
+        unrelated = server._install_lan_runtime(third)
+
+        assert second.workspace_lock is first.workspace_lock
+        assert unrelated.workspace_lock is not first.workspace_lock
+    finally:
+        (
+            server._projects,
+            server._default_project,
+            server._store,
+            server._runner,
+            server._config,
+            server._config_path,
+            server._lan_mode_active,
+            server._lan_state_dir,
+        ) = old_state
+
+
 def test_lan_lists_historical_jobs_from_read_only_database(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     job_dir = state_dir / "jobs" / "historical-project"
@@ -520,9 +609,14 @@ def test_lan_lists_historical_jobs_from_read_only_database(tmp_path: Path) -> No
         ) = old_state
 
 
-def test_lan_reads_persisted_jobs_after_restart(tmp_path: Path) -> None:
+def test_lan_reads_persisted_jobs_after_restart(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     state_dir = tmp_path / "state"
-    project = "lan-persisted-nfl-research"
+    key = "a" * 20
+    task = "nfl-research"
+    project = f"lan-{key}-{task}"
     log_dir = state_dir / "jobs" / project
     store = JobStore(log_dir / "jobs.db")
     job = store.create_job(
@@ -532,6 +626,28 @@ def test_lan_reads_persisted_jobs_after_restart(tmp_path: Path) -> None:
     )
     store.set_completed(job["job_id"])
     (log_dir / "e49c6bca.log").write_text("completed\n", encoding="utf-8")
+    artifact_dir = state_dir / "work" / key / task / job["job_id"]
+    artifact_dir.mkdir(parents=True)
+    artifact = artifact_dir / "result.json"
+    artifact.write_bytes(b'{"status":"ok"}\n')
+    (artifact_dir / "artifact_manifest.json").write_text(
+        json.dumps(
+            {
+                "run_label": "v38",
+                "job_id": job["job_id"],
+                "produced_at": "2026-08-23T12:00:00Z",
+                "artifacts": [
+                    {
+                        "path": artifact.name,
+                        "bytes": artifact.stat().st_size,
+                        "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TRAINERD_API_KEY", "secret")
     old_state = (
         server._lan_mode_active,
         server._lan_state_dir,
@@ -556,6 +672,11 @@ def test_lan_reads_persisted_jobs_after_restart(tmp_path: Path) -> None:
         assert client.get("/api/jobs").json()[0]["job_id"] == "e49c6bca"
         assert client.get("/api/jobs/e49c6bca").json()["status"] == "completed"
         assert client.get("/api/jobs/e49c6bca/logs").text == "completed\n"
+        headers = {"X-API-Key": "secret"}
+        listed = client.get("/api/jobs/e49c6bca/artifacts", headers=headers)
+        assert listed.status_code == 200
+        downloaded = client.get("/api/jobs/e49c6bca/artifacts/0", headers=headers)
+        assert downloaded.content == artifact.read_bytes()
     finally:
         client.close()
         (
@@ -568,3 +689,157 @@ def test_lan_reads_persisted_jobs_after_restart(tmp_path: Path) -> None:
             server._config,
             server._config_path,
         ) = old_state
+
+
+def test_prepare_lan_project_fails_actionably_when_git_metadata_unwritable(
+    tmp_path: Path,
+) -> None:
+    if sys.platform == "win32":
+        pytest.skip("POSIX permission bits are not authoritative on Windows")
+    state_dir = tmp_path / "state"
+    repo_url = normalize_repo_url("http://git.local/team/repo.git")
+    checkout = state_dir / "repos" / repo_key(repo_url)
+    checkout.parent.mkdir(parents=True)
+    subprocess.run(["git", "init", str(checkout)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(checkout), "remote", "add", "origin", "http://git.local/team/repo.git"],
+        check=True,
+        capture_output=True,
+    )
+    _write_manifest(checkout)
+    (checkout / "tracked.txt").write_text("one\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.name", "Test"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.email", "test@example.com"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "add", ".trainerd.yaml", "tracked.txt"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "commit", "-m", "one"],
+        check=True,
+        capture_output=True,
+    )
+
+    git_dir = checkout / ".git"
+    git_dir.chmod(stat.S_IRUSR | stat.S_IXUSR)
+    try:
+        with pytest.raises(LanConfigError) as error:
+            prepare_lan_project(state_dir, repo_url, "nfl-train")
+    finally:
+        git_dir.chmod(stat.S_IRWXU)
+
+    message = str(error.value)
+    assert str(checkout) in message
+    assert "service identity" in message
+    assert "stable Windows account" in message
+
+
+def test_prepare_lan_project_probes_existing_reflog_writability(tmp_path: Path) -> None:
+    if sys.platform == "win32":
+        pytest.skip("POSIX permission bits are not authoritative on Windows")
+    state_dir = tmp_path / "state"
+    repo_url = normalize_repo_url("http://git.local/team/repo.git")
+    checkout = state_dir / "repos" / repo_key(repo_url)
+    checkout.parent.mkdir(parents=True)
+    subprocess.run(["git", "init", str(checkout)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(checkout), "remote", "add", "origin", "http://git.local/team/repo.git"],
+        check=True,
+        capture_output=True,
+    )
+    _write_manifest(checkout)
+    (checkout / "tracked.txt").write_text("one\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.name", "Test"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.email", "test@example.com"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "add", ".trainerd.yaml", "tracked.txt"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "commit", "-m", "one"],
+        check=True,
+        capture_output=True,
+    )
+
+    # The issue's exact failure mode: a writable .git root containing an
+    # unwritable existing reflog. The root probe passes; the reflog probe must
+    # still catch it before git fetch fails mid-job.
+    git_dir = checkout / ".git"
+    reflog = git_dir / "logs" / "refs" / "remotes" / "origin" / "main"
+    reflog.parent.mkdir(parents=True)
+    reflog.write_text("", encoding="utf-8")
+    reflog.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+    try:
+        with pytest.raises(LanConfigError) as error:
+            prepare_lan_project(state_dir, repo_url, "nfl-train")
+    finally:
+        reflog.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+
+    message = str(error.value)
+    assert "Reflog is not writable" in message
+    assert "logs/refs/remotes" in message
+    assert "service identity" in message
+
+
+def test_writable_directory_probe_is_unique_and_cleanup_tolerant(
+    tmp_path: Path,
+) -> None:
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        assert all(pool.map(_probe_writable_dir, [tmp_path] * 32))
+    assert list(tmp_path.iterdir()) == []
+
+    class FailedCleanup:
+        def close(self) -> None:
+            raise OSError("cleanup failed")
+
+    with patch("trainerd.lan.tempfile.TemporaryFile", return_value=FailedCleanup()):
+        assert _probe_writable_dir(tmp_path)
+
+
+def test_reflog_probe_ignores_disappearance_and_windows_sharing(
+    tmp_path: Path,
+) -> None:
+    with patch(
+        "trainerd.lan.os.open",
+        side_effect=FileNotFoundError(2, "No such file or directory"),
+    ):
+        assert _probe_appendable(tmp_path / "gone")
+
+    sharing_violation = OSError("sharing violation")
+    sharing_violation.winerror = 32  # type: ignore[attr-defined]
+    with patch("trainerd.lan.os.open", side_effect=sharing_violation):
+        assert _probe_appendable(tmp_path / "busy")
+
+    with patch("trainerd.lan.os.open", return_value=123), patch(
+        "trainerd.lan.os.close"
+    ) as close:
+        assert _probe_appendable(tmp_path / "reflog")
+        close.assert_called_once_with(123)
+
+
+def test_writable_checkout_handles_unknown_service_user(tmp_path: Path) -> None:
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    with patch("trainerd.lan._probe_writable_dir", return_value=False), patch(
+        "trainerd.lan.getpass.getuser", side_effect=KeyError
+    ):
+        with pytest.raises(LanConfigError, match=r"service identity '(uid \d+|unknown)'"):
+            _require_writable_checkout(checkout)

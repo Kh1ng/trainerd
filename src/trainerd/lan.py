@@ -6,10 +6,13 @@ provide commands or filesystem paths.
 """
 from __future__ import annotations
 
+import errno
+import getpass
 import hashlib
 import os
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -135,6 +138,7 @@ def prepare_lan_project(
         actual_url = _git(checkout, "remote", "get-url", "origin").strip()
         if normalize_repo_url(actual_url) != normalized_url:
             raise LanConfigError("Managed checkout origin does not match requested repo")
+        _require_writable_checkout(checkout)
         _require_clean_tracked_checkout(checkout)
         _git(checkout, "fetch", "origin")
         if selected_branch is not None:
@@ -422,6 +426,81 @@ def _require_clean_tracked_checkout(repo_path: Path) -> None:
             )
         if result.returncode != 0:
             raise LanConfigError(f"Could not inspect managed checkout: {result.stderr.strip()}")
+
+
+def _require_writable_checkout(checkout: Path) -> None:
+    """Fail before sync when the current account cannot write Git metadata.
+
+    A checkout may have reflogs or refs owned by a different Windows account
+    after a service-user change. The `.git` root can look writable while an
+    existing reflog is not, so probe the nested paths `git fetch` writes
+    instead of relying on the root or on permission bits.
+    """
+    git_dir = checkout / ".git"
+    problems: list[str] = []
+    if not _probe_writable_dir(git_dir):
+        problems.append(f"Git metadata root is not writable: {git_dir}")
+    for relative in sorted(_existing_reflogs(git_dir)):
+        if not _probe_appendable(git_dir / relative):
+            problems.append(f"Reflog is not writable: {relative}")
+    for relative in (
+        "logs",
+        "refs",
+        "logs/refs/remotes",
+        "refs/remotes",
+        "logs/refs/heads",
+        "refs/heads",
+    ):
+        directory = git_dir / relative
+        if directory.is_dir() and not _probe_writable_dir(directory):
+            problems.append(f"Git metadata directory is not writable: {relative}")
+    if problems:
+        try:
+            service = getpass.getuser()
+        except KeyError:
+            service = f"uid {os.getuid()}" if hasattr(os, "getuid") else "unknown"
+        raise LanConfigError(
+            f"Managed checkout Git metadata is not writable by the current "
+            f"service identity {service!r}: {checkout} ({'; '.join(problems)}). "
+            f"Grant the trainerd service account recursive control of the "
+            f"checkout, or keep the state directory owned by one stable "
+            f"Windows account, then resubmit."
+        )
+
+
+def _existing_reflogs(git_dir: Path) -> list[Path]:
+    """Relative paths of every reflog file under the metadata directory."""
+    logs = git_dir / "logs"
+    if not logs.is_dir():
+        return []
+    return [path.relative_to(git_dir) for path in logs.rglob("*") if path.is_file()]
+
+
+def _probe_appendable(path: Path) -> bool:
+    """Check write permission by opening append-only; no content is written."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT or getattr(exc, "winerror", None) in {32, 33}:
+            return True
+        return False
+    try:
+        return True
+    finally:
+        os.close(fd)
+
+
+def _probe_writable_dir(path: Path) -> bool:
+    """Check that a new entry can be created in a directory."""
+    try:
+        probe = tempfile.TemporaryFile(prefix=".trainerd-write-probe-", dir=path)
+    except OSError:
+        return False
+    try:
+        probe.close()
+    except OSError:
+        pass
+    return True
 
 
 def _git(repo_path: Path, *args: str) -> str:
