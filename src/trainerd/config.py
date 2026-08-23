@@ -70,6 +70,7 @@ class TrainingConfig:
     required_env: tuple[str, ...] = ()
     lan_task_source: str | None = None
     lan_task_definition: dict[str, Any] | None = None
+    lan_task_definition_hash: str | None = None
 
 
 @dataclass(frozen=True)

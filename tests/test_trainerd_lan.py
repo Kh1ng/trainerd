@@ -478,11 +478,31 @@ def test_server_owned_task_survives_pinned_checkout_reload(tmp_path: Path) -> No
 
     assert prepared.config.lan_task_source == "server_config"
     assert prepared.config.steps[0].cmd == definitions["train"]["steps"][0]["cmd"]
+    expected_hash = hashlib.sha256(
+        json.dumps(
+            definitions["train"],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert prepared.config.lan_task_definition_hash == expected_hash
     pinned = tmp_path / "pinned"
     pinned.mkdir()
     reloaded = load_lan_job_config(prepared.config, pinned, branch="main")
     assert reloaded.lan_task_source == "server_config"
     assert reloaded.steps[0].cmd == prepared.config.steps[0].cmd
+    assert reloaded.lan_task_definition_hash == expected_hash
+
+    server._runtime.configure_lan(state_dir, 1, server.StageQueuePool())
+    runtime = server._runtime.install_lan(prepared)
+    submitted = server._queue_job(runtime, {"version": "v1"})
+    assert runtime.store.get_job(submitted["job_id"])["task_definition_hash"] == expected_hash
+    assert prepared.config.lan_task_definition is not None
+    prepared.config.lan_task_definition["steps"][0]["cmd"] = "changed"
+    with pytest.raises(LanConfigError, match="changed after submission"):
+        load_lan_job_config(prepared.config, pinned, branch="main")
+    server._runtime.reset()
 
 
 def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
