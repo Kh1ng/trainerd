@@ -229,26 +229,31 @@ async def _queue_worker() -> None:
 
 async def _run_job_wrapper(job_id: str, project: str | None = None) -> None:
     """Wrap runner.run_job to handle exceptions."""
-    found = _runtime.find_job(job_id)
-    runtime = _select_runtime(project) if project else (found[0] if found else _runtime.default())
     try:
-        await runtime.runner.run_job(job_id)
-    except asyncio.CancelledError:
-        log.info("Job %s was cancelled", job_id)
-        job = runtime.store.get_job(job_id)
-        if job and job["status"] in (JobStatus.PENDING, JobStatus.RUNNING):
-            stages = job.get("stages") or {}
-            if stages and not any(
-                stage.get("status") in {"running", "failed"}
-                for stage in stages.values()
-            ):
-                runtime.store.set_pending(job_id)
-            else:
-                runtime.store.set_failed(job_id, "Cancelled via API")
-        raise
-    except Exception:
-        log.exception("Unexpected error in job %s", job_id)
-        runtime.store.set_failed(job_id, "Internal error — see server logs")
+        found = _runtime.find_job(job_id)
+        runtime = (
+            _select_runtime(project)
+            if project
+            else (found[0] if found else _runtime.default())
+        )
+        try:
+            await runtime.runner.run_job(job_id)
+        except asyncio.CancelledError:
+            log.info("Job %s was cancelled", job_id)
+            job = runtime.store.get_job(job_id)
+            if job and job["status"] in (JobStatus.PENDING, JobStatus.RUNNING):
+                stages = job.get("stages") or {}
+                if stages and not any(
+                    stage.get("status") in {"running", "failed"}
+                    for stage in stages.values()
+                ):
+                    runtime.store.set_pending(job_id)
+                else:
+                    runtime.store.set_failed(job_id, "Cancelled via API")
+            raise
+        except Exception:
+            log.exception("Unexpected error in job %s", job_id)
+            runtime.store.set_failed(job_id, "Internal error — see server logs")
     finally:
         _runtime.running_tasks.pop(job_id, None)
         _runtime.wake_queue()
@@ -513,7 +518,10 @@ async def _prepare_lan_runtime(
 
     try:
         normalized_repo = normalize_repo_url(selected_repo)
-        allowed_repos = _lan_allowed_repo_urls()
+        try:
+            allowed_repos = _lan_allowed_repo_urls()
+        except ValueError as exc:
+            raise LanConfigError(str(exc)) from exc
         if allowed_repos and normalized_repo not in allowed_repos:
             raise HTTPException(
                 status_code=403,
