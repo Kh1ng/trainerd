@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import ast
 import hashlib
 import json
 from pathlib import Path
 
+import pytest
 import yaml
 from fastapi.testclient import TestClient
 
@@ -163,6 +165,24 @@ def test_trainerd_submit_status_logs_and_cancel_contract(tmp_path: Path) -> None
         after = client.get(f"/api/jobs/{job_id}")
         assert after.status_code == 200
         assert after.json()["status"] == "failed"
+    finally:
+        client.close()
+        _restore_trainerd_server(old_state)
+
+
+def test_run_job_wrapper_propagates_cancellation(tmp_path: Path, monkeypatch) -> None:
+    client, old_state = _configure_trainerd_server(tmp_path)
+    job_id = "job-cancelled"
+    server_mod._store.create_job(job_id, steps=["train"], version="v1")
+
+    async def cancel(_job_id: str) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(server_mod._runner, "run_job", cancel)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(server_mod._run_job_wrapper(job_id))
+        assert server_mod._store.get_job(job_id, "status") == "failed"
     finally:
         client.close()
         _restore_trainerd_server(old_state)
@@ -475,6 +495,8 @@ def test_job_artifacts_are_authenticated_and_integrity_checked(tmp_path: Path) -
         job_dir.mkdir(parents=True)
         artifact = job_dir / "result.json"
         artifact.write_bytes(b'{"status":"ok"}\n')
+        second_artifact = job_dir / "metrics.json"
+        second_artifact.write_bytes(b'{"score":1}\n')
         server_mod._config.work_dir = work_dir
         server_mod._store.create_job(job_id, steps=["train"], version="v9")
         server_mod._store.set_completed(job_id)
@@ -488,7 +510,12 @@ def test_job_artifacts_are_authenticated_and_integrity_checked(tmp_path: Path) -
                     "path": "result.json",
                     "bytes": artifact.stat().st_size,
                     "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
-                }
+                },
+                {
+                    "path": "metrics.json",
+                    "bytes": second_artifact.stat().st_size,
+                    "sha256": hashlib.sha256(second_artifact.read_bytes()).hexdigest(),
+                },
             ],
         }
         manifest_path = job_dir / "artifact_manifest.json"
@@ -504,6 +531,15 @@ def test_job_artifacts_are_authenticated_and_integrity_checked(tmp_path: Path) -
         downloaded = client.get(f"/api/jobs/{job_id}/artifacts/0", headers=headers)
         assert downloaded.status_code == 200
         assert downloaded.content == artifact.read_bytes()
+
+        second_artifact.write_bytes(b"tampered")
+        assert client.get(
+            f"/api/jobs/{job_id}/artifacts/0", headers=headers
+        ).status_code == 200
+        assert client.get(
+            f"/api/jobs/{job_id}/artifacts/1", headers=headers
+        ).status_code == 422
+        second_artifact.write_bytes(b'{"score":1}\n')
 
         artifact.write_bytes(b"tampered")
         assert client.get(f"/api/jobs/{job_id}/artifacts/0", headers=headers).status_code == 422

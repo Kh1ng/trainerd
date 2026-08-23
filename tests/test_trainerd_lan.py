@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import sqlite3
 import stat
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -373,7 +376,9 @@ def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
         # returns. Its task reservation must still block a checkout pull.
         runtime.store.set_completed(result["job_id"])
         server._running_tasks[result["job_id"]] = object()  # type: ignore[assignment]
-        with patch("trainerd.server.prepare_lan_project") as prepare_again:
+        with patch(
+            "trainerd.server.prepare_lan_project", return_value=prepared
+        ) as prepare_again:
             validating = client.post(
                 "/api/jobs",
                 json={
@@ -382,7 +387,7 @@ def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
                 },
             )
         assert validating.status_code == 409
-        prepare_again.assert_not_called()
+        prepare_again.assert_called_once()
         server._running_tasks.pop(result["job_id"], None)
 
         prepared.config.max_concurrent_jobs = 2
@@ -472,6 +477,83 @@ def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
         ) = old_state
 
 
+def test_lan_uses_new_task_limit_and_repository_workspace_locks(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("TRAINERD_ALLOWED_REPOS", raising=False)
+    prepared = _prepared(tmp_path)
+    prepared.config.max_concurrent_jobs = 1
+    other_project = f"lan-{prepared.repo_key}-other"
+    other = replace(
+        prepared,
+        project=other_project,
+        task="other",
+        config=replace(
+            prepared.config,
+            project=other_project,
+            work_dir=tmp_path / "state" / "work" / prepared.repo_key / "other",
+            log_dir=tmp_path / "state" / "jobs" / other_project,
+            max_concurrent_jobs=2,
+        ),
+    )
+    third_key = "b" * 20
+    third_project = f"lan-{third_key}-other"
+    third = replace(
+        other,
+        project=third_project,
+        repo_key=third_key,
+        config=replace(
+            other.config,
+            project=third_project,
+            work_dir=tmp_path / "state" / "work" / third_key / "other",
+            log_dir=tmp_path / "state" / "jobs" / third_project,
+        ),
+    )
+    old_state = (
+        server._projects,
+        server._default_project,
+        server._store,
+        server._runner,
+        server._config,
+        server._config_path,
+        server._lan_mode_active,
+        server._lan_state_dir,
+    )
+    server._projects = {}
+    server._default_project = None
+    server._store = None
+    server._runner = None
+    server._config = None
+    server._config_path = None
+    server._lan_mode_active = True
+    server._lan_state_dir = tmp_path / "state"
+    try:
+        first = server._install_lan_runtime(prepared)
+        first.store.create_job("existing", ["train"], "v1")
+        with patch("trainerd.server.prepare_lan_project", return_value=other):
+            second, _ = asyncio.run(
+                server._prepare_lan_runtime(
+                    {"repo": prepared.repo_url, "task": "other"}
+                )
+            )
+        unrelated = server._install_lan_runtime(third)
+
+        assert second.workspace_lock is first.workspace_lock
+        assert unrelated.workspace_lock is not first.workspace_lock
+    finally:
+        (
+            server._projects,
+            server._default_project,
+            server._store,
+            server._runner,
+            server._config,
+            server._config_path,
+            server._lan_mode_active,
+            server._lan_state_dir,
+        ) = old_state
+
+
 def test_lan_lists_historical_jobs_from_read_only_database(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     job_dir = state_dir / "jobs" / "historical-project"
@@ -520,9 +602,14 @@ def test_lan_lists_historical_jobs_from_read_only_database(tmp_path: Path) -> No
         ) = old_state
 
 
-def test_lan_reads_persisted_jobs_after_restart(tmp_path: Path) -> None:
+def test_lan_reads_persisted_jobs_after_restart(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     state_dir = tmp_path / "state"
-    project = "lan-persisted-nfl-research"
+    key = "a" * 20
+    task = "nfl-research"
+    project = f"lan-{key}-{task}"
     log_dir = state_dir / "jobs" / project
     store = JobStore(log_dir / "jobs.db")
     job = store.create_job(
@@ -532,6 +619,28 @@ def test_lan_reads_persisted_jobs_after_restart(tmp_path: Path) -> None:
     )
     store.set_completed(job["job_id"])
     (log_dir / "e49c6bca.log").write_text("completed\n", encoding="utf-8")
+    artifact_dir = state_dir / "work" / key / task / job["job_id"]
+    artifact_dir.mkdir(parents=True)
+    artifact = artifact_dir / "result.json"
+    artifact.write_bytes(b'{"status":"ok"}\n')
+    (artifact_dir / "artifact_manifest.json").write_text(
+        json.dumps(
+            {
+                "run_label": "v38",
+                "job_id": job["job_id"],
+                "produced_at": "2026-08-23T12:00:00Z",
+                "artifacts": [
+                    {
+                        "path": artifact.name,
+                        "bytes": artifact.stat().st_size,
+                        "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TRAINERD_API_KEY", "secret")
     old_state = (
         server._lan_mode_active,
         server._lan_state_dir,
@@ -556,6 +665,11 @@ def test_lan_reads_persisted_jobs_after_restart(tmp_path: Path) -> None:
         assert client.get("/api/jobs").json()[0]["job_id"] == "e49c6bca"
         assert client.get("/api/jobs/e49c6bca").json()["status"] == "completed"
         assert client.get("/api/jobs/e49c6bca/logs").text == "completed\n"
+        headers = {"X-API-Key": "secret"}
+        listed = client.get("/api/jobs/e49c6bca/artifacts", headers=headers)
+        assert listed.status_code == 200
+        downloaded = client.get("/api/jobs/e49c6bca/artifacts/0", headers=headers)
+        assert downloaded.content == artifact.read_bytes()
     finally:
         client.close()
         (

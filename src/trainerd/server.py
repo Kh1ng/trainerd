@@ -41,7 +41,6 @@ from .lan import (
     default_state_dir,
     normalize_repo_url,
     prepare_lan_project,
-    repo_key,
 )
 from .runner import JobRunner, StageQueuePool
 from .storage import JobStore, JobStatus
@@ -63,6 +62,7 @@ class ProjectRuntime:
     store: JobStore
     runner: JobRunner
     lan_repo_key: str | None = None
+    workspace_lock: asyncio.Lock | None = None
 
 
 _server_config: ServerConfig | None = None
@@ -440,6 +440,7 @@ async def _run_job_wrapper(job_id: str, project: str | None = None) -> None:
                 runtime.store.set_pending(job_id)
             else:
                 runtime.store.set_failed(job_id, "Cancelled via API")
+        raise
     except Exception:
         log.exception("Unexpected error in job %s", job_id)
         runtime.store.set_failed(job_id, "Internal error — see server logs")
@@ -767,19 +768,6 @@ async def _prepare_lan_runtime(
                 status_code=403,
                 detail="Repository is not allowlisted on this trainerd host",
             )
-        selected_key = repo_key(normalized_repo)
-        existing = [
-            runtime
-            for runtime in _projects.values()
-            if runtime.lan_repo_key == selected_key
-        ]
-        if existing and sum(_lan_runtime_load(runtime) for runtime in existing) >= max(
-            runtime.config.max_concurrent_jobs for runtime in existing
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail="This repository has reached its configured concurrent job limit",
-            )
         prepared = await asyncio.to_thread(
             prepare_lan_project,
             _lan_state_dir,
@@ -821,11 +809,20 @@ def _install_lan_runtime(prepared: LanPreparedProject) -> ProjectRuntime:
         return existing
 
     store = JobStore(prepared.config.log_dir / "jobs.db")
+    workspace_lock = next(
+        (
+            runtime.workspace_lock
+            for runtime in _projects.values()
+            if runtime.lan_repo_key == prepared.repo_key
+            and runtime.workspace_lock is not None
+        ),
+        None,
+    ) or asyncio.Lock()
     runner = JobRunner(
         store,
         prepared.config,
         queues=_stage_queues,
-        workspace_lock=_lan_prepare_lock,
+        workspace_lock=workspace_lock,
     )
     runtime = ProjectRuntime(
         prepared.project,
@@ -834,6 +831,7 @@ def _install_lan_runtime(prepared: LanPreparedProject) -> ProjectRuntime:
         store,
         runner,
         lan_repo_key=prepared.repo_key,
+        workspace_lock=workspace_lock,
     )
     _recover_stale_jobs(runtime)
     if repository_load + _lan_runtime_load(runtime) >= prepared.config.max_concurrent_jobs:
@@ -1053,11 +1051,34 @@ async def stream_logs(job_id: str, request: Request, tail: int | None = None) ->
     return StreamingResponse(_generate(), media_type="text/plain")
 
 
+def _find_job_artifact_context(job_id: str) -> tuple[Path, dict] | None:
+    """Return the daemon-owned work directory and job, including after restart."""
+    found = _find_job_runtime(job_id)
+    if found:
+        runtime, job = found
+        return runtime.config.work_dir, job
+    persisted = _find_persisted_lan_job(job_id)
+    if not persisted or _lan_state_dir is None:
+        return None
+    project, _, _, job = persisted
+    match = re.fullmatch(
+        r"lan-([0-9a-f]{20})-([A-Za-z0-9][A-Za-z0-9._-]{0,63})",
+        project,
+    )
+    if not match:
+        return None
+    return _lan_state_dir / "work" / match[1] / match[2], job
+
+
 def _validated_job_artifacts(
-    runtime: ProjectRuntime,
+    work_dir: Path,
     job: dict,
+    artifact_index: int | None = None,
 ) -> tuple[dict[str, Any], list[Path]]:
-    job_root = (runtime.config.work_dir / job["job_id"]).resolve()
+    work_root = work_dir.resolve()
+    job_root = (work_root / job["job_id"]).resolve()
+    if not job_root.is_relative_to(work_root):
+        raise HTTPException(status_code=422, detail="Artifact directory has an invalid path")
     manifest_path = (job_root / "artifact_manifest.json").resolve()
     if not manifest_path.is_relative_to(job_root):
         raise HTTPException(status_code=422, detail="Artifact manifest has an invalid path")
@@ -1084,8 +1105,12 @@ def _validated_job_artifacts(
     if sum(declared_bytes) > _MAX_ARTIFACT_BYTES:
         raise HTTPException(status_code=413, detail="Declared artifacts are too large")
 
+    if artifact_index is not None and not 0 <= artifact_index < len(entries):
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    selected = range(len(entries)) if artifact_index is None else (artifact_index,)
     paths: list[Path] = []
-    for index, entry in enumerate(entries):
+    for index in selected:
+        entry = entries[index]
         try:
             relative = Path(entry["path"])
             path = (job_root / relative).resolve()
@@ -1117,11 +1142,11 @@ def _validated_job_artifacts(
 
 @app.get("/api/jobs/{job_id}/artifacts", dependencies=[Depends(_required_api_key_auth)])
 async def list_job_artifacts(job_id: str) -> dict:
-    found = _find_job_runtime(job_id)
-    if not found:
+    context = _find_job_artifact_context(job_id)
+    if not context:
         raise HTTPException(status_code=404, detail="Job not found")
-    runtime, job = found
-    manifest, _ = await asyncio.to_thread(_validated_job_artifacts, runtime, job)
+    work_dir, job = context
+    manifest, _ = await asyncio.to_thread(_validated_job_artifacts, work_dir, job)
     return {
         **manifest,
         "artifacts": [
@@ -1136,14 +1161,14 @@ async def list_job_artifacts(job_id: str) -> dict:
 
 @app.get("/api/jobs/{job_id}/artifacts/{artifact_index}", dependencies=[Depends(_required_api_key_auth)])
 async def download_job_artifact(job_id: str, artifact_index: int) -> Response:
-    found = _find_job_runtime(job_id)
-    if not found:
+    context = _find_job_artifact_context(job_id)
+    if not context:
         raise HTTPException(status_code=404, detail="Job not found")
-    runtime, job = found
-    _, paths = await asyncio.to_thread(_validated_job_artifacts, runtime, job)
-    if artifact_index < 0 or artifact_index >= len(paths):
-        raise HTTPException(status_code=404, detail="Artifact not found")
-    return FileResponse(paths[artifact_index], filename=paths[artifact_index].name)
+    work_dir, job = context
+    _, paths = await asyncio.to_thread(
+        _validated_job_artifacts, work_dir, job, artifact_index
+    )
+    return FileResponse(paths[0], filename=paths[0].name)
 
 
 @app.delete("/api/jobs/{job_id}", dependencies=[Depends(_api_key_auth)])
