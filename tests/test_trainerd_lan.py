@@ -5,6 +5,9 @@ import hashlib
 import json
 import sqlite3
 import stat
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -19,9 +22,13 @@ from trainerd.config import StepConfig
 from trainerd.lan import (
     LanConfigError,
     LanPreparedProject,
+    _probe_appendable,
+    _probe_writable_dir,
+    _require_writable_checkout,
     load_lan_task,
     normalize_branch,
     normalize_repo_url,
+    prepare_lan_project,
     repo_key,
 )
 from trainerd.storage import JobStore
@@ -682,3 +689,157 @@ def test_lan_reads_persisted_jobs_after_restart(
             server._config,
             server._config_path,
         ) = old_state
+
+
+def test_prepare_lan_project_fails_actionably_when_git_metadata_unwritable(
+    tmp_path: Path,
+) -> None:
+    if sys.platform == "win32":
+        pytest.skip("POSIX permission bits are not authoritative on Windows")
+    state_dir = tmp_path / "state"
+    repo_url = normalize_repo_url("http://git.local/team/repo.git")
+    checkout = state_dir / "repos" / repo_key(repo_url)
+    checkout.parent.mkdir(parents=True)
+    subprocess.run(["git", "init", str(checkout)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(checkout), "remote", "add", "origin", "http://git.local/team/repo.git"],
+        check=True,
+        capture_output=True,
+    )
+    _write_manifest(checkout)
+    (checkout / "tracked.txt").write_text("one\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.name", "Test"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.email", "test@example.com"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "add", ".trainerd.yaml", "tracked.txt"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "commit", "-m", "one"],
+        check=True,
+        capture_output=True,
+    )
+
+    git_dir = checkout / ".git"
+    git_dir.chmod(stat.S_IRUSR | stat.S_IXUSR)
+    try:
+        with pytest.raises(LanConfigError) as error:
+            prepare_lan_project(state_dir, repo_url, "nfl-train")
+    finally:
+        git_dir.chmod(stat.S_IRWXU)
+
+    message = str(error.value)
+    assert str(checkout) in message
+    assert "service identity" in message
+    assert "stable Windows account" in message
+
+
+def test_prepare_lan_project_probes_existing_reflog_writability(tmp_path: Path) -> None:
+    if sys.platform == "win32":
+        pytest.skip("POSIX permission bits are not authoritative on Windows")
+    state_dir = tmp_path / "state"
+    repo_url = normalize_repo_url("http://git.local/team/repo.git")
+    checkout = state_dir / "repos" / repo_key(repo_url)
+    checkout.parent.mkdir(parents=True)
+    subprocess.run(["git", "init", str(checkout)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(checkout), "remote", "add", "origin", "http://git.local/team/repo.git"],
+        check=True,
+        capture_output=True,
+    )
+    _write_manifest(checkout)
+    (checkout / "tracked.txt").write_text("one\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.name", "Test"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "user.email", "test@example.com"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "add", ".trainerd.yaml", "tracked.txt"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "commit", "-m", "one"],
+        check=True,
+        capture_output=True,
+    )
+
+    # The issue's exact failure mode: a writable .git root containing an
+    # unwritable existing reflog. The root probe passes; the reflog probe must
+    # still catch it before git fetch fails mid-job.
+    git_dir = checkout / ".git"
+    reflog = git_dir / "logs" / "refs" / "remotes" / "origin" / "main"
+    reflog.parent.mkdir(parents=True)
+    reflog.write_text("", encoding="utf-8")
+    reflog.chmod(stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+    try:
+        with pytest.raises(LanConfigError) as error:
+            prepare_lan_project(state_dir, repo_url, "nfl-train")
+    finally:
+        reflog.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+
+    message = str(error.value)
+    assert "Reflog is not writable" in message
+    assert "logs/refs/remotes" in message
+    assert "service identity" in message
+
+
+def test_writable_directory_probe_is_unique_and_cleanup_tolerant(
+    tmp_path: Path,
+) -> None:
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        assert all(pool.map(_probe_writable_dir, [tmp_path] * 32))
+    assert list(tmp_path.iterdir()) == []
+
+    class FailedCleanup:
+        def close(self) -> None:
+            raise OSError("cleanup failed")
+
+    with patch("trainerd.lan.tempfile.TemporaryFile", return_value=FailedCleanup()):
+        assert _probe_writable_dir(tmp_path)
+
+
+def test_reflog_probe_ignores_disappearance_and_windows_sharing(
+    tmp_path: Path,
+) -> None:
+    with patch(
+        "trainerd.lan.os.open",
+        side_effect=FileNotFoundError(2, "No such file or directory"),
+    ):
+        assert _probe_appendable(tmp_path / "gone")
+
+    sharing_violation = OSError("sharing violation")
+    sharing_violation.winerror = 32  # type: ignore[attr-defined]
+    with patch("trainerd.lan.os.open", side_effect=sharing_violation):
+        assert _probe_appendable(tmp_path / "busy")
+
+    with patch("trainerd.lan.os.open", return_value=123), patch(
+        "trainerd.lan.os.close"
+    ) as close:
+        assert _probe_appendable(tmp_path / "reflog")
+        close.assert_called_once_with(123)
+
+
+def test_writable_checkout_handles_unknown_service_user(tmp_path: Path) -> None:
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    with patch("trainerd.lan._probe_writable_dir", return_value=False), patch(
+        "trainerd.lan.getpass.getuser", side_effect=KeyError
+    ):
+        with pytest.raises(LanConfigError, match=r"service identity '(uid \d+|unknown)'"):
+            _require_writable_checkout(checkout)
