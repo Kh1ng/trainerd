@@ -434,16 +434,18 @@ The probe arguments must contain `{probe_port}`. LAN probe arguments must also
 contain `{probe_state_dir}`. Use an isolated registry file for a registry-mode
 probe.
 
-The helper compares the mode, authentication requirement, repository count,
-and project list before cutover. It refuses to continue when one value differs.
+The helper compares the mode, authentication requirement, and complete LAN
+policy hash before cutover. Loaded project history does not affect this hash.
 
-The helper first stops the Scheduled Task. If its PowerShell child remains, the
-helper can stop only the process that owns the Trainerd port. The process must
-also match the prior version, an empty queue, and a `trainerd serve` command
-line. The helper does not stop a process that fails one of these checks.
+The replacement Scheduled Task runs `trainerd.exe serve` directly. The helper
+first stops the Scheduled Task. If Trainerd remains, the helper can stop only
+the process that owns the Trainerd port. The process must match the prior
+version, an empty queue, and a `trainerd serve` command line. The helper does
+not stop a process that fails one of these checks.
 
 If the switch fails, the helper restores the prior task action. It also checks
-the prior version after rollback. Versioned startup logs use append mode.
+the prior version after rollback. The probe writes separate versioned output
+and error logs.
 
 ## Legacy single-project mode
 

@@ -20,8 +20,8 @@ Safety rules enforced by this script:
   - Stops the Scheduled Task and, only when needed, the verified trainerd
     process that owns the configured listening port.
   - Requires explicit live and isolated-probe serve arguments, then compares
-    their authentication mode and allowlists before cutover.
-  - Preserves the prior task action and appends versioned startup logs.
+    their authentication mode and complete LAN policy before cutover.
+  - Preserves the prior task action and makes Task Scheduler own trainerd.exe.
   - Verifies status=ok and the expected version after the switch.
   - On any failure, restores the prior action through one shared rollback path
     and verifies health against the prior version.
@@ -155,7 +155,14 @@ function Assert-SamePolicy {
         [object]$Expected,
         [object]$Candidate
     )
-    foreach ($field in @("mode", "authentication_required", "allowed_repository_count", "projects")) {
+    $fields = @("mode", "authentication_required")
+    if ($Expected.mode -eq "lan") {
+        $fields += "lan_policy_hash"
+    }
+    else {
+        $fields += "projects"
+    }
+    foreach ($field in $fields) {
         $expectedValue = $Expected.$field | ConvertTo-Json -Compress
         $candidateValue = $Candidate.$field | ConvertTo-Json -Compress
         if ($expectedValue -cne $candidateValue) {
@@ -228,7 +235,14 @@ function Restore-PriorAction {
     if (-not (Stop-DaemonTask -ExpectedVersion $ExpectedVersion)) {
         return $false
     }
-    $oldAction = New-ScheduledTaskAction -Execute $Execute -Argument $Arguments -WorkingDirectory $WorkingDirectory
+    $actionParameters = @{
+        Execute = $Execute
+        Argument = $Arguments
+    }
+    if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
+        $actionParameters.WorkingDirectory = $WorkingDirectory
+    }
+    $oldAction = New-ScheduledTaskAction @actionParameters
     Set-ScheduledTask -TaskName $TaskName -Action $oldAction -ErrorAction Stop
     Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
     return Wait-For-Health -BaseUrl $HealthUrl -ExpectedVersion $ExpectedVersion -Attempts 30
@@ -308,8 +322,8 @@ finally {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $probeDir
 }
 
-# 4. Preserve the prior task action and build the versioned launcher before
-#    touching the task, so a launcher failure leaves the live task untouched.
+# 4. Preserve the prior task action and build the direct replacement action
+#    before touching the task.
 Write-Host "Preserving prior task action for $TaskName ..."
 $task = Get-ScheduledTask -TaskName $TaskName
 if (-not $task -or -not $task.Actions -or $task.Actions.Count -lt 1) {
@@ -320,16 +334,8 @@ $priorExecute = $priorAction.Execute
 $priorArguments = $priorAction.Arguments
 $priorWorkingDirectory = $priorAction.WorkingDirectory
 
-$launcherPath = Join-Path $logDir "run-lan-$Version.ps1"
-$startupLog = Join-Path $logDir "startup-$Version.log"
-$launcherBody = @"
-param()
-`$ErrorActionPreference = "Stop"
-& "$pythonExe" -m trainerd serve $ServeArguments *>> "$startupLog"
-"@
-$launcherBody | Out-File -FilePath $launcherPath -Encoding utf8
-$newAction = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$launcherPath`"" `
+$newAction = New-ScheduledTaskAction -Execute $trainerdExe `
+    -Argument "serve $ServeArguments" `
     -WorkingDirectory $logDir
 
 # 5. Recheck the queue immediately before the cutover so a job submitted
