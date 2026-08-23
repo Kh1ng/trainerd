@@ -33,6 +33,7 @@ from trainerd.lan import (
     normalize_branch,
     normalize_repo_url,
     prepare_lan_project,
+    prepare_persisted_lan_project,
     repo_key,
 )
 from trainerd.storage import JobStore
@@ -850,6 +851,98 @@ def test_lan_reads_persisted_jobs_after_restart(
     finally:
         client.close()
         server._runtime.reset()
+
+
+def test_lan_recovers_pending_job_runtime_before_queue_start(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    state_dir = tmp_path / "state"
+    prepared = _prepared(tmp_path)
+    project = prepared.project
+    log_dir = state_dir / "jobs" / project
+    config = replace(
+        prepared.config,
+        repo=replace(
+            prepared.config.repo,
+            local_path=str(state_dir / "repos" / prepared.repo_key),
+        ),
+        work_dir=state_dir / "work" / prepared.repo_key / prepared.task,
+        log_dir=log_dir,
+        max_concurrent_jobs=1,
+    )
+    prepared = replace(prepared, config=config)
+    store = JobStore(log_dir / "jobs.db")
+    store.create_job(
+        "pending-job",
+        steps=["train"],
+        version="v1",
+        repo_sha=prepared.revision,
+    )
+    monkeypatch.setenv("TRAINERD_LAN_MODE", "1")
+    monkeypatch.setenv("TRAINERD_STATE_DIR", str(state_dir))
+    monkeypatch.delenv("TRAINERD_ALLOWED_REPOS", raising=False)
+    server._runtime.reset()
+
+    async def idle_queue_worker() -> None:
+        await asyncio.Event().wait()
+
+    with patch(
+        "trainerd.server.prepare_persisted_lan_project", return_value=prepared
+    ), patch("trainerd.server.prepare_lan_project", return_value=prepared), patch(
+        "trainerd.server._queue_worker", new=idle_queue_worker
+    ), TestClient(server.app) as client:
+        runtime = server._runtime.projects[project]
+        assert [job["job_id"] for _, job in server._runtime.pending_candidates()] == [
+            "pending-job"
+        ]
+
+        response = client.post(
+            "/api/jobs",
+            json={"repo": prepared.repo_url, "task": prepared.task, "version": "v2"},
+        )
+        assert response.status_code == 409
+        assert runtime.store.list_job_ids() == ["pending-job"]
+
+
+def test_prepare_persisted_lan_project_enforces_current_repository_policy(
+    tmp_path: Path,
+) -> None:
+    prepared = _prepared(tmp_path)
+    policy = LanRepositoryPolicy(
+        prepared.repo_url,
+        {"nfl-train": {"steps": [{"id": "train", "cmd": "train"}]}},
+    )
+    with patch("trainerd.lan._git", return_value=prepared.repo_url), patch(
+        "trainerd.lan.prepare_lan_project", return_value=prepared
+    ) as prepare:
+        assert prepare_persisted_lan_project(
+            tmp_path / "state",
+            prepared.project,
+            {prepared.repo_url: policy},
+        ) == prepared
+    prepare.assert_called_once_with(
+        tmp_path / "state",
+        prepared.repo_url,
+        "nfl-train",
+        task_definitions=policy.tasks,
+    )
+
+    with patch("trainerd.lan._git", return_value=prepared.repo_url), pytest.raises(
+        LanConfigError, match="no longer allowlisted"
+    ):
+        prepare_persisted_lan_project(
+            tmp_path / "state",
+            prepared.project,
+            {"http://git.local/team/other.git": policy},
+        )
+
+    with pytest.raises(LanConfigError, match="Invalid persisted LAN project id"):
+        prepare_persisted_lan_project(
+            tmp_path / "state",
+            "lan-../../outside-task",
+            {},
+        )
 
 
 def test_prepare_lan_project_fails_actionably_when_git_metadata_unwritable(

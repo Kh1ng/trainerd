@@ -310,15 +310,7 @@ class DaemonRuntime:
             log.warning("Recovered stale running job %s as %s", job_id, status)
 
     def install_lan(self, prepared: LanPreparedProject) -> ProjectRuntime:
-        """Install or refresh a prepared LAN project within repository limits."""
-        repository_load = sum(
-            self._lan_project_load(project)
-            for project in self.projects.values()
-            if project.lan_repo_key == prepared.repo_key
-        )
-        if repository_load >= prepared.config.max_concurrent_jobs:
-            raise RepositoryCapacityError
-
+        """Install or refresh a prepared LAN project."""
         existing = self.projects.get(prepared.project)
         if existing is not None:
             existing.config = prepared.config
@@ -350,8 +342,6 @@ class DaemonRuntime:
             workspace_lock=workspace_lock,
         )
         self.recover_stale_jobs(project)
-        if repository_load + self._lan_project_load(project) >= prepared.config.max_concurrent_jobs:
-            raise RepositoryCapacityError
         for job_id in store.list_job_ids():
             if self.find_job(job_id) is not None:
                 raise RuntimeError(f"Duplicate historical job id {job_id!r} in LAN state")
@@ -359,6 +349,16 @@ class DaemonRuntime:
         if self.default_project is None:
             self.default_project = prepared.project
         return project
+
+    def ensure_lan_capacity(self, project: ProjectRuntime) -> None:
+        """Reject a new job when its repository has no free task slot."""
+        repository_load = sum(
+            self._lan_project_load(candidate)
+            for candidate in self.projects.values()
+            if candidate.lan_repo_key == project.lan_repo_key
+        )
+        if repository_load >= project.config.max_concurrent_jobs:
+            raise RepositoryCapacityError
 
     def _lan_project_load(self, project: ProjectRuntime) -> int:
         pending = set(project.store.list_job_ids(status=JobStatus.PENDING))
