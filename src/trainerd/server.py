@@ -50,6 +50,7 @@ from .lan import (
     load_lan_server_config,
     normalize_repo_url,
     prepare_lan_project,
+    prepare_persisted_lan_project,
 )
 from .runner import StageQueuePool
 from .runtime import (
@@ -259,6 +260,29 @@ async def _run_job_wrapper(job_id: str, project: str | None = None) -> None:
         _runtime.wake_queue()
 
 
+async def _recover_lan_runtimes() -> None:
+    """Load persisted LAN runtimes that still own active jobs."""
+    state_dir = _runtime.lan_state_dir
+    if state_dir is None:
+        return
+    for project, store, _ in _runtime.persisted_lan_stores():
+        active = store.list_job_ids(status=JobStatus.PENDING)
+        active += store.list_job_ids(status=JobStatus.RUNNING)
+        if not active:
+            continue
+        try:
+            prepared = await asyncio.to_thread(
+                prepare_persisted_lan_project,
+                state_dir,
+                project,
+                _runtime.lan_repositories,
+            )
+            _runtime.install_lan(prepared)
+            log.info("Recovered LAN project %s with %s active job(s)", project, len(active))
+        except (LanConfigError, RuntimeError):
+            log.exception("Could not recover active LAN project %s", project)
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     try:
@@ -298,6 +322,7 @@ async def _lifespan(app: FastAPI):
             repositories=repositories,
             config_path=lan_config_path,
         )
+        await _recover_lan_runtimes()
     else:
         _runtime.configure_projects(load_server_config(), stage_queues)
 
@@ -416,6 +441,14 @@ async def submit_job(body: JobRequest = JobRequest()) -> dict:
 
 def _queue_job(runtime: ProjectRuntime, payload: dict[str, Any]) -> dict:
     """Validate and persist one job against its selected runtime."""
+    if _runtime.lan_mode:
+        try:
+            _runtime.ensure_lan_capacity(runtime)
+        except RepositoryCapacityError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="This repository has reached its configured concurrent job limit",
+            ) from exc
     config = _runtime.refresh(runtime)
     store = runtime.store
     requested_steps = payload.get("steps")
@@ -539,13 +572,7 @@ async def _prepare_lan_runtime(
         )
     except LanConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    try:
-        runtime = _runtime.install_lan(prepared)
-    except RepositoryCapacityError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail="This repository has reached its configured concurrent job limit",
-        ) from exc
+    runtime = _runtime.install_lan(prepared)
 
     sanitized = {
         key: value

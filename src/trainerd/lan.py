@@ -263,6 +263,37 @@ def prepare_lan_project(
     )
 
 
+def prepare_persisted_lan_project(
+    state_dir: Path,
+    project: str,
+    repositories: dict[str, LanRepositoryPolicy],
+) -> LanPreparedProject:
+    """Rebuild one persisted LAN runtime from its managed checkout."""
+    prefix = "lan-"
+    value = project.removeprefix(prefix)
+    key, separator, task = value.partition("-")
+    if (
+        not project.startswith(prefix)
+        or not separator
+        or len(key) != 20
+        or any(character not in "0123456789abcdef" for character in key)
+    ):
+        raise LanConfigError(f"Invalid persisted LAN project id: {project}")
+    checkout = state_dir.expanduser().resolve() / "repos" / key
+    repo_url = normalize_repo_url(_git(checkout, "remote", "get-url", "origin").strip())
+    if repo_key(repo_url) != key:
+        raise LanConfigError(f"Persisted LAN project {project} does not match its repository")
+    if repositories and repo_url not in repositories:
+        raise LanConfigError(f"Persisted LAN project {project} is no longer allowlisted")
+    policy = repositories.get(repo_url)
+    return prepare_lan_project(
+        state_dir,
+        repo_url,
+        task,
+        task_definitions=policy.tasks if policy else None,
+    )
+
+
 def inject_managed_env(config: TrainingConfig, state_dir: Path) -> None:
     """Inject only the managed names explicitly requested by a LAN task."""
     try:
