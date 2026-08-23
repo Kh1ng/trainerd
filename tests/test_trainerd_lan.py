@@ -25,6 +25,8 @@ from trainerd.lan import (
     _probe_appendable,
     _probe_writable_dir,
     _require_writable_checkout,
+    load_lan_job_config,
+    load_lan_server_config,
     load_lan_task,
     normalize_branch,
     normalize_repo_url,
@@ -272,6 +274,7 @@ def test_cli_lan_mode_has_zero_config_listener_defaults() -> None:
         cpu_concurrency=None,
         gpu_capacity=None,
         allowed_repos=None,
+        lan_config=None,
     )
 
 
@@ -300,6 +303,15 @@ def test_cli_lan_mode_passes_repository_allowlist() -> None:
     ]
 
 
+def test_cli_lan_mode_passes_persistent_config() -> None:
+    with patch("trainerd.server.main") as serve:
+        assert trainerd_main(
+            ["serve", "--lan", "--lan-config", "C:/ProgramData/trainerd/lan.yaml"]
+        ) == 0
+
+    assert serve.call_args.kwargs["lan_config"] == "C:/ProgramData/trainerd/lan.yaml"
+
+
 def test_lan_allowlist_requires_api_key_and_normalizes(monkeypatch) -> None:
     monkeypatch.setenv(
         "TRAINERD_ALLOWED_REPOS",
@@ -316,6 +328,163 @@ def test_lan_allowlist_requires_api_key_and_normalizes(monkeypatch) -> None:
     }
 
 
+def test_lan_server_config_normalizes_repositories_and_validates_tasks(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "lan.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "repositories": [
+                    {"repo": "HTTP://GIT.LOCAL/team/manifest.git/"},
+                    {
+                        "repo": "http://git.local/team/server.git",
+                        "tasks": {
+                            "train": {
+                                "required_env": ["DATABASE_URL"],
+                                "steps": [{"id": "run", "cmd": "python train.py"}],
+                            }
+                        },
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    repositories = load_lan_server_config(path)
+
+    assert sorted(repositories) == [
+        "http://git.local/team/manifest.git",
+        "http://git.local/team/server.git",
+    ]
+    assert repositories["http://git.local/team/manifest.git"].tasks is None
+    assert set(repositories["http://git.local/team/server.git"].tasks or {}) == {"train"}
+
+    duplicate = yaml.safe_load(path.read_text(encoding="utf-8"))
+    duplicate["repositories"].append(
+        {"repo": "http://git.local/team/manifest.git"}
+    )
+    path.write_text(yaml.safe_dump(duplicate), encoding="utf-8")
+    with pytest.raises(LanConfigError, match="Duplicate normalized repository"):
+        load_lan_server_config(path)
+
+    too_many_tasks = {
+        "version": 1,
+        "repositories": [
+            {
+                "repo": "http://git.local/team/server.git",
+                "tasks": {
+                    f"task-{index}": {"steps": [{"id": "run", "cmd": "run"}]}
+                    for index in range(65)
+                },
+            }
+        ],
+    }
+    path.write_text(yaml.safe_dump(too_many_tasks), encoding="utf-8")
+    with pytest.raises(LanConfigError, match="1-64 tasks"):
+        load_lan_server_config(path)
+
+
+def test_authenticated_lan_config_view_omits_commands(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "lan.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "repositories": [
+                    {"repo": "http://git.local/team/manifest.git"},
+                    {
+                        "repo": "http://git.local/team/server.git",
+                        "tasks": {"train": {"steps": [{"id": "run", "cmd": "secret-command"}]}},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TRAINERD_API_KEY", "secret")
+    monkeypatch.setenv("TRAINERD_LAN_MODE", "1")
+    monkeypatch.setenv("TRAINERD_STATE_DIR", str(tmp_path / "state"))
+    server._runtime.lan_config_path = path
+    with TestClient(server.app) as client:
+        assert client.get("/api/lan/config").status_code == 401
+        response = client.get(
+            "/api/lan/config", headers={"X-API-Key": "secret"}
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "repositories": [
+                {
+                    "repo": "http://git.local/team/manifest.git",
+                    "task_source": "repository_manifest",
+                    "tasks": [],
+                },
+                {
+                    "repo": "http://git.local/team/server.git",
+                    "task_source": "server_config",
+                    "tasks": ["train"],
+                },
+            ]
+        }
+        assert "secret-command" not in response.text
+
+    server._runtime.lan_config_path = path
+    with TestClient(server.app) as client:
+        restarted = client.get(
+            "/api/lan/config", headers={"X-API-Key": "secret"}
+        )
+        assert restarted.json() == response.json()
+
+
+def test_server_owned_task_survives_pinned_checkout_reload(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    repo_url = "http://git.local/team/server.git"
+    checkout = state_dir / "repos" / repo_key(repo_url)
+    (checkout / ".git").mkdir(parents=True)
+    definitions = {
+        "train": {
+            "steps": [
+                {
+                    "id": "run",
+                    "cmd": 'python train.py --output "{work_dir}"',
+                    "cwd": ".",
+                }
+            ]
+        }
+    }
+
+    def git_result(_checkout: Path, *args: str) -> str:
+        if args == ("remote", "get-url", "origin"):
+            return repo_url
+        if args == ("branch", "--show-current"):
+            return "main"
+        if args == ("rev-parse", "HEAD"):
+            return "a" * 40
+        return ""
+
+    with (
+        patch("trainerd.lan._git", side_effect=git_result),
+        patch("trainerd.lan._require_writable_checkout"),
+        patch("trainerd.lan._require_clean_tracked_checkout"),
+    ):
+        prepared = prepare_lan_project(
+            state_dir,
+            repo_url,
+            "train",
+            task_definitions=definitions,
+        )
+
+    assert prepared.config.lan_task_source == "server_config"
+    assert prepared.config.steps[0].cmd == definitions["train"]["steps"][0]["cmd"]
+    pinned = tmp_path / "pinned"
+    pinned.mkdir()
+    reloaded = load_lan_job_config(prepared.config, pinned, branch="main")
+    assert reloaded.lan_task_source == "server_config"
+    assert reloaded.steps[0].cmd == prepared.config.steps[0].cmd
+
+
 def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
     tmp_path: Path,
     monkeypatch,
@@ -324,30 +493,7 @@ def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
     monkeypatch.delenv("TRAINERD_ALLOWED_REPOS", raising=False)
     prepared = _prepared(tmp_path)
     prepared.config.steps.append(StepConfig("evaluate", "Evaluate", "evaluate"))
-    old_state = (
-        server._server_config,
-        server._projects,
-        server._default_project,
-        server._store,
-        server._runner,
-        server._config,
-        server._config_path,
-        server._lan_mode_active,
-        server._lan_state_dir,
-        server._lan_prepare_lock,
-        server._running_tasks,
-    )
-    server._server_config = None
-    server._projects = {}
-    server._default_project = None
-    server._store = None
-    server._runner = None
-    server._config = None
-    server._config_path = None
-    server._lan_mode_active = True
-    server._lan_state_dir = tmp_path / "state"
-    server._lan_prepare_lock = asyncio.Lock()
-    server._running_tasks = {}
+    server._runtime.configure_lan(tmp_path / "state", 1, server.StageQueuePool())
 
     client = TestClient(server.app)
     try:
@@ -369,12 +515,13 @@ def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
         assert result["steps"] == ["train"]
         assert result["queued"] is True
         prepare.assert_called_once_with(
-            server._lan_state_dir,
+            server._runtime.lan_state_dir,
             "http://git.local/team/repo.git",
             "nfl-train",
             branch="feature/mod4",
+            task_definitions=None,
         )
-        runtime = server._projects[prepared.project]
+        runtime = server._runtime.projects[prepared.project]
         assert runtime.store.get_job(result["job_id"])["branch"] == "feature/mod4"
         assert runtime.store.get_job(result["job_id"])
         assert client.get("/api/health").json()["mode"] == "lan"
@@ -382,7 +529,7 @@ def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
         # A runner marks the row completed before its validation subprocess
         # returns. Its task reservation must still block a checkout pull.
         runtime.store.set_completed(result["job_id"])
-        server._running_tasks[result["job_id"]] = object()  # type: ignore[assignment]
+        server._runtime.running_tasks[result["job_id"]] = object()  # type: ignore[assignment]
         with patch(
             "trainerd.server.prepare_lan_project", return_value=prepared
         ) as prepare_again:
@@ -395,7 +542,7 @@ def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
             )
         assert validating.status_code == 409
         prepare_again.assert_called_once()
-        server._running_tasks.pop(result["job_id"], None)
+        server._runtime.running_tasks.pop(result["job_id"], None)
 
         prepared.config.max_concurrent_jobs = 2
         with patch("trainerd.server.prepare_lan_project", return_value=prepared):
@@ -469,19 +616,7 @@ def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
         blocked_prepare.assert_not_called()
     finally:
         client.close()
-        (
-            server._server_config,
-            server._projects,
-            server._default_project,
-            server._store,
-            server._runner,
-            server._config,
-            server._config_path,
-            server._lan_mode_active,
-            server._lan_state_dir,
-            server._lan_prepare_lock,
-            server._running_tasks,
-        ) = old_state
+        server._runtime.reset()
 
 
 def test_lan_uses_new_task_limit_and_repository_workspace_locks(
@@ -517,26 +652,9 @@ def test_lan_uses_new_task_limit_and_repository_workspace_locks(
             log_dir=tmp_path / "state" / "jobs" / third_project,
         ),
     )
-    old_state = (
-        server._projects,
-        server._default_project,
-        server._store,
-        server._runner,
-        server._config,
-        server._config_path,
-        server._lan_mode_active,
-        server._lan_state_dir,
-    )
-    server._projects = {}
-    server._default_project = None
-    server._store = None
-    server._runner = None
-    server._config = None
-    server._config_path = None
-    server._lan_mode_active = True
-    server._lan_state_dir = tmp_path / "state"
+    server._runtime.configure_lan(tmp_path / "state", 1, server.StageQueuePool())
     try:
-        first = server._install_lan_runtime(prepared)
+        first = server._runtime.install_lan(prepared)
         first.store.create_job("existing", ["train"], "v1")
         with patch("trainerd.server.prepare_lan_project", return_value=other):
             second, _ = asyncio.run(
@@ -544,21 +662,12 @@ def test_lan_uses_new_task_limit_and_repository_workspace_locks(
                     {"repo": prepared.repo_url, "task": "other"}
                 )
             )
-        unrelated = server._install_lan_runtime(third)
+        unrelated = server._runtime.install_lan(third)
 
         assert second.workspace_lock is first.workspace_lock
         assert unrelated.workspace_lock is not first.workspace_lock
     finally:
-        (
-            server._projects,
-            server._default_project,
-            server._store,
-            server._runner,
-            server._config,
-            server._config_path,
-            server._lan_mode_active,
-            server._lan_state_dir,
-        ) = old_state
+        server._runtime.reset()
 
 
 def test_lan_lists_historical_jobs_from_read_only_database(tmp_path: Path) -> None:
@@ -572,22 +681,7 @@ def test_lan_lists_historical_jobs_from_read_only_database(tmp_path: Path) -> No
         conn.execute("DROP INDEX jobs_status_created_at")
         conn.execute("DROP INDEX jobs_version_status_created_at")
     database.chmod(stat.S_IREAD)
-    old_state = (
-        server._projects,
-        server._store,
-        server._runner,
-        server._config,
-        server._config_path,
-        server._lan_mode_active,
-        server._lan_state_dir,
-    )
-    server._projects = {}
-    server._store = None
-    server._runner = None
-    server._config = None
-    server._config_path = None
-    server._lan_mode_active = True
-    server._lan_state_dir = state_dir
+    server._runtime.configure_lan(state_dir, 1, server.StageQueuePool())
 
     client = TestClient(server.app)
     try:
@@ -598,15 +692,7 @@ def test_lan_lists_historical_jobs_from_read_only_database(tmp_path: Path) -> No
     finally:
         client.close()
         database.chmod(stat.S_IWRITE | stat.S_IREAD)
-        (
-            server._projects,
-            server._store,
-            server._runner,
-            server._config,
-            server._config_path,
-            server._lan_mode_active,
-            server._lan_state_dir,
-        ) = old_state
+        server._runtime.reset()
 
 
 def test_lan_reads_persisted_jobs_after_restart(
@@ -648,24 +734,7 @@ def test_lan_reads_persisted_jobs_after_restart(
         encoding="utf-8",
     )
     monkeypatch.setenv("TRAINERD_API_KEY", "secret")
-    old_state = (
-        server._lan_mode_active,
-        server._lan_state_dir,
-        server._projects,
-        server._default_project,
-        server._store,
-        server._runner,
-        server._config,
-        server._config_path,
-    )
-    server._lan_mode_active = True
-    server._lan_state_dir = state_dir
-    server._projects = {}
-    server._default_project = None
-    server._store = None
-    server._runner = None
-    server._config = None
-    server._config_path = None
+    server._runtime.configure_lan(state_dir, 1, server.StageQueuePool())
 
     client = TestClient(server.app)
     try:
@@ -679,16 +748,7 @@ def test_lan_reads_persisted_jobs_after_restart(
         assert downloaded.content == artifact.read_bytes()
     finally:
         client.close()
-        (
-            server._lan_mode_active,
-            server._lan_state_dir,
-            server._projects,
-            server._default_project,
-            server._store,
-            server._runner,
-            server._config,
-            server._config_path,
-        ) = old_state
+        server._runtime.reset()
 
 
 def test_prepare_lan_project_fails_actionably_when_git_metadata_unwritable(

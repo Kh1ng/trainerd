@@ -17,8 +17,10 @@ Safety rules enforced by this script:
     reusing or overwriting an existing one.
   - Probes the candidate on an alternate port with an isolated LAN state dir
     that is guaranteed distinct from the live state directory.
-  - Stops only the trainerd-lan Scheduled Task. It never kills unrelated
-    Python processes.
+  - Stops the Scheduled Task and, only when needed, the verified trainerd
+    process that owns the configured listening port.
+  - Requires explicit live and isolated-probe serve arguments, then compares
+    their authentication mode and allowlists before cutover.
   - Preserves the prior task action and appends versioned startup logs.
   - Verifies status=ok and the expected version after the switch.
   - On any failure, restores the prior action through one shared rollback path
@@ -29,6 +31,13 @@ Candidate release version, e.g. 0.3.12. Used for the venv directory and logs.
 
 .PARAMETER WheelUrl
 URL or local path to the candidate wheel to install.
+
+.PARAMETER ServeArguments
+Exact arguments after `trainerd serve` for the replacement daemon.
+
+.PARAMETER ProbeArguments
+Exact arguments after `trainerd serve` for the isolated candidate probe. Use
+{probe_port} and {probe_state_dir} placeholders where those values belong.
 
 .PARAMETER TaskName
 Name of the Scheduled Task that runs the daemon (default: trainerd-lan).
@@ -52,7 +61,9 @@ and never deletes anything it did not create.
 
 .EXAMPLE
 .\trainerd-upgrade.ps1 -Version 0.3.13 `
-  -WheelUrl https://github.com/Kh1ng/trainerd/releases/download/v0.3.13/trainerd-0.3.13-py3-none-any.whl
+  -WheelUrl https://github.com/Kh1ng/trainerd/releases/download/v0.3.13/trainerd-0.3.13-py3-none-any.whl `
+  -ServeArguments '--lan --state-dir "C:\ProgramData\trainerd\state" --host 0.0.0.0 --port 7860' `
+  -ProbeArguments '--lan --state-dir "{probe_state_dir}" --host 127.0.0.1 --port {probe_port}'
 #>
 [CmdletBinding()]
 param(
@@ -61,6 +72,12 @@ param(
 
     [Parameter(Mandatory = $true)]
     [string]$WheelUrl,
+
+    [Parameter(Mandatory = $true)]
+    [string]$ServeArguments,
+
+    [Parameter(Mandatory = $true)]
+    [string]$ProbeArguments,
 
     [string]$TaskName = "trainerd-lan",
     [string]$StateDir = "C:\ProgramData\trainerd\state",
@@ -74,6 +91,12 @@ $ErrorActionPreference = "Stop"
 
 if (-not $ProbeStateDir) {
     $ProbeStateDir = Join-Path $InstallRoot "probe-state"
+}
+if (-not $ProbeArguments.Contains("{probe_port}")) {
+    throw "ProbeArguments must contain {probe_port}."
+}
+if ($ProbeArguments -match '(?i)(^|\s)--lan(\s|$)' -and -not $ProbeArguments.Contains("{probe_state_dir}")) {
+    throw "LAN ProbeArguments must contain {probe_state_dir}."
 }
 
 $venvDir = Join-Path $InstallRoot "venvs\$Version"
@@ -126,6 +149,74 @@ function Get-QueueState {
     }
 }
 
+function Assert-SamePolicy {
+    param(
+        [object]$Expected,
+        [object]$Candidate
+    )
+    foreach ($field in @("mode", "authentication_required", "allowed_repository_count", "projects")) {
+        $expectedValue = $Expected.$field | ConvertTo-Json -Compress
+        $candidateValue = $Candidate.$field | ConvertTo-Json -Compress
+        if ($expectedValue -cne $candidateValue) {
+            throw "Candidate policy mismatch for $field (live=$expectedValue candidate=$candidateValue)."
+        }
+    }
+}
+
+function Stop-VerifiedTrainerdListener {
+    param([string]$ExpectedVersion)
+    $health = Get-HealthJson -BaseUrl $HealthUrl
+    if (
+        -not $health -or
+        $health.status -ne "ok" -or
+        $health.version -ne $ExpectedVersion -or
+        $health.pending_jobs -gt 0 -or $health.running_jobs -gt 0
+    ) {
+        return $false
+    }
+
+    $listenPort = ([uri]$HealthUrl).Port
+    $listenerPids = @(
+        Get-NetTCPConnection -LocalPort $listenPort -State Listen -ErrorAction Stop |
+            Select-Object -ExpandProperty OwningProcess -Unique
+    )
+    if ($listenerPids.Count -ne 1) {
+        return $false
+    }
+    $listenerPid = [int]$listenerPids[0]
+    $process = Get-CimInstance Win32_Process -Filter "ProcessId = $listenerPid"
+    if (
+        -not $process -or
+        $process.CommandLine -notmatch '(?i)trainerd' -or
+        $process.CommandLine -notmatch '(?i)(^|\s)serve(\s|$)'
+    ) {
+        return $false
+    }
+    Stop-Process -Id $listenerPid -Force -ErrorAction Stop
+    return $true
+}
+
+function Stop-DaemonTask {
+    param([string]$ExpectedVersion)
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+    for ($i = 0; $i -lt 15; $i++) {
+        if (-not (Get-HealthJson -BaseUrl $HealthUrl)) {
+            return $true
+        }
+        Start-Sleep -Seconds 2
+    }
+    if (-not (Stop-VerifiedTrainerdListener -ExpectedVersion $ExpectedVersion)) {
+        return $false
+    }
+    for ($i = 0; $i -lt 15; $i++) {
+        if (-not (Get-HealthJson -BaseUrl $HealthUrl)) {
+            return $true
+        }
+        Start-Sleep -Seconds 2
+    }
+    return $false
+}
+
 function Restore-PriorAction {
     param(
         [string]$Execute,
@@ -133,7 +224,9 @@ function Restore-PriorAction {
         [string]$WorkingDirectory,
         [string]$ExpectedVersion
     )
-    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if (-not (Stop-DaemonTask -ExpectedVersion $Version)) {
+        return $false
+    }
     $oldAction = New-ScheduledTaskAction -Execute $Execute -Argument $Arguments -WorkingDirectory $WorkingDirectory
     Set-ScheduledTask -TaskName $TaskName -Action $oldAction -ErrorAction Stop
     Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
@@ -192,8 +285,9 @@ Write-Host "Probing candidate on port $ProbePort with isolated state $probeDir .
 $probeOutputLog = Join-Path $logDir "probe-$Version.stdout.log"
 $probeErrorLog = Join-Path $logDir "probe-$Version.stderr.log"
 $probeHealth = "http://127.0.0.1:$ProbePort"
-$probeProcess = Start-Process -FilePath $trainerdExe `
-    -ArgumentList @("serve", "--lan", "--state-dir", "`"$probeDir`"", "--host", "127.0.0.1", "--port", "$ProbePort") `
+$probeArgumentsResolved = $ProbeArguments.Replace("{probe_port}", "$ProbePort").Replace("{probe_state_dir}", "`"$probeDir`"")
+$probeProcess = Start-Process -FilePath $pythonExe `
+    -ArgumentList "-m trainerd serve $probeArgumentsResolved" `
     -RedirectStandardOutput $probeOutputLog `
     -RedirectStandardError $probeErrorLog `
     -PassThru `
@@ -203,6 +297,8 @@ try {
     if (-not $healthy) {
         throw "Candidate did not reach status=ok version=$Version on port $ProbePort. See $probeOutputLog and $probeErrorLog"
     }
+    $candidateHealth = Get-HealthJson -BaseUrl $probeHealth
+    Assert-SamePolicy -Expected $live -Candidate $candidateHealth
     Write-Host "Candidate probe healthy."
 }
 finally {
@@ -230,7 +326,7 @@ $startupLog = Join-Path $logDir "startup-$Version.log"
 $launcherBody = @"
 param()
 `$ErrorActionPreference = "Stop"
-& "$trainerdExe" serve --lan --state-dir "$StateDir" --host 0.0.0.0 --port 7860 *>> "$startupLog"
+& "$pythonExe" -m trainerd serve $ServeArguments *>> "$startupLog"
 "@
 $launcherBody | Out-File -FilePath $launcherPath -Encoding utf8
 $newAction = New-ScheduledTaskAction -Execute "powershell.exe" `
@@ -245,24 +341,25 @@ if ($queue.Pending -gt 0 -or $queue.Running -gt 0) {
 }
 
 Write-Host "Stopping task $TaskName and switching to $Version ..."
+$taskActionChanged = $false
 try {
-    Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop
-    # Wait for the old daemon to release the port before the new one binds.
-    $oldDown = $false
-    for ($i = 0; $i -lt 15; $i++) {
-        if (-not (Get-HealthJson -BaseUrl $HealthUrl)) {
-            $oldDown = $true
-            break
-        }
-        Start-Sleep -Seconds 2
-    }
-    if (-not $oldDown) {
-        throw "Old daemon did not stop; refusing to switch."
+    if (-not (Stop-DaemonTask -ExpectedVersion $priorVersion)) {
+        throw "The old daemon did not release its port. Its listener did not pass the trainerd identity and empty-queue checks."
     }
     Set-ScheduledTask -TaskName $TaskName -Action $newAction -ErrorAction Stop
+    $taskActionChanged = $true
     Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
 }
 catch {
+    if (-not $taskActionChanged) {
+        if (-not (Get-HealthJson -BaseUrl $HealthUrl)) {
+            Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+            if (-not (Wait-For-Health -BaseUrl $HealthUrl -ExpectedVersion $priorVersion -Attempts 30)) {
+                throw "Rollback failed: prior task action did not return to version $priorVersion."
+            }
+        }
+        throw "Switch to $Version failed before changing the task action. Prior action retained: $_"
+    }
     Write-Warning "Switch failed; restoring prior action."
     if (-not (Restore-PriorAction -Execute $priorExecute -Arguments $priorArguments -WorkingDirectory $priorWorkingDirectory -ExpectedVersion $priorVersion)) {
         throw "Rollback failed: daemon did not return to prior version $priorVersion after restoring the prior action."
@@ -273,6 +370,16 @@ catch {
 # 6. Verify status=ok and the expected version.
 Write-Host "Verifying $Version on $HealthUrl ..."
 $verified = Wait-For-Health -BaseUrl $HealthUrl -ExpectedVersion $Version
+if ($verified) {
+    try {
+        $installedHealth = Get-HealthJson -BaseUrl $HealthUrl
+        Assert-SamePolicy -Expected $live -Candidate $installedHealth
+    }
+    catch {
+        Write-Warning "Installed daemon policy verification failed: $_"
+        $verified = $false
+    }
+}
 if (-not $verified) {
     Write-Warning "Candidate verification failed; restoring prior action."
     if (-not (Restore-PriorAction -Execute $priorExecute -Arguments $priorArguments -WorkingDirectory $priorWorkingDirectory -ExpectedVersion $priorVersion)) {

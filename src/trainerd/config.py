@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .contracts import is_safe_identifier
+
 try:
     import yaml
 except ImportError:
@@ -66,6 +68,8 @@ class TrainingConfig:
     log_dir: Path
     max_concurrent_jobs: int = 1
     required_env: tuple[str, ...] = ()
+    lan_task_source: str | None = None
+    lan_task_definition: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -90,7 +94,6 @@ class ServerConfig:
 
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
-_PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 def _expand_env(value: str) -> str:
@@ -107,7 +110,7 @@ def _resolve(value: str, work_dir: Path, repo_path: str) -> str:
         .replace("{work_dir}", str(work_dir))
         .replace("{repo_path}", repo_path)
         # NOTE: {version} is intentionally NOT resolved here — the runner
-        # substitutes it at job-dispatch time via _resolve_cmd().
+        # substitutes it at job-dispatch time via _resolve_template().
     )
 
 
@@ -263,7 +266,7 @@ def load_server_config(
     projects: dict[str, ConfiguredProject] = {}
     for project_id, entry in raw_projects.items():
         project_id = str(project_id).strip()
-        if not _PROJECT_ID_PATTERN.fullmatch(project_id):
+        if not is_safe_identifier(project_id):
             raise ValueError(f"Invalid trainerd project id: {project_id!r}")
         if project_id in projects:
             raise ValueError(f"Duplicate normalized trainerd project id: {project_id!r}")

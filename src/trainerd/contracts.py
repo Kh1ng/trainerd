@@ -7,32 +7,37 @@ independently of each other's release cadence.
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
-JOB_PAYLOAD_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        # Optional startup-allowlisted project identifier. Clients never send
-        # config paths or commands; omission preserves single-project clients.
-        "project": {"type": "string"},
-        # Explicitly insecure LAN mode resolves these to a daemon-owned checkout
-        # and a repository-owned `.trainerd.yaml` task.
-        "repo": {"type": "string"},
-        "repo_url": {"type": "string"},
-        "task": {"type": "string"},
-        # Opaque run label. "cv_v42" means nothing to trainerd; it is only
-        # substituted into {version} slots in step command templates.
-        "version": {"type": "string"},
-        "steps": {"type": "array", "items": {"type": "string"}},
-        "branch": {"type": "string"},
-        # Opaque template substitutions — domain vocabulary lives client-side.
-        "markets": {"type": "string"},
-        "extra_args": {"type": "string"},
-        "force": {"type": "boolean"},
-        "triggered_by": {"type": "string"},
-    },
-    "additionalProperties": False,
-}
+from pydantic import BaseModel, ConfigDict, StrictBool, StrictStr
+
+
+class JobRequest(BaseModel):
+    """Fields an HTTP client may submit; commands and paths stay server-owned."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    project: StrictStr | None = None
+    repo: StrictStr | None = None
+    repo_url: StrictStr | None = None
+    task: StrictStr | None = None
+    version: StrictStr | None = None
+    steps: list[StrictStr] | None = None
+    branch: StrictStr | None = None
+    markets: StrictStr | None = None
+    extra_args: StrictStr | None = None
+    force: StrictBool = False
+    triggered_by: StrictStr = "api"
+
+
+JOB_PAYLOAD_SCHEMA: dict[str, Any] = JobRequest.model_json_schema()
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def is_safe_identifier(value: object) -> bool:
+    """Return whether value uses the shared bounded identifier syntax."""
+    return isinstance(value, str) and _SAFE_IDENTIFIER.fullmatch(value) is not None
 
 ARTIFACT_MANIFEST_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -77,11 +82,20 @@ def validate_payload(payload: dict[str, Any], schema: dict[str, Any] = JOB_PAYLO
             problems.append(f"missing required field: {key}")
     _types = {"string": str, "boolean": bool, "integer": int, "array": list, "object": dict}
     for key, spec in props.items():
-        if key in payload and spec.get("type") in _types:
-            if not isinstance(payload[key], _types[spec["type"]]):
-                problems.append(f"{key}: expected {spec['type']}")
-            elif spec.get("type") == "array":
-                item_spec = spec.get("items", {})
+        value_schema = spec
+        if spec.get("type") is None:
+            non_null = [
+                choice
+                for choice in spec.get("anyOf", [])
+                if choice.get("type") != "null"
+            ]
+            value_schema = non_null[0] if len(non_null) == 1 else spec
+        expected_type = value_schema.get("type")
+        if key in payload and expected_type in _types:
+            if not isinstance(payload[key], _types[expected_type]):
+                problems.append(f"{key}: expected {expected_type}")
+            elif expected_type == "array":
+                item_spec = value_schema.get("items", {})
                 for i, item in enumerate(payload[key]):
                     sub = validate_payload(item, item_spec) if item_spec.get("type") == "object" else []
                     if item_spec.get("type") == "string" and not isinstance(item, str):

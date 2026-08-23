@@ -5,9 +5,9 @@ import sys
 import time
 from types import SimpleNamespace
 
+import pytest
 import yaml
 from fastapi.testclient import TestClient
-import pytest
 
 
 def test_queue_wakes_for_submissions_and_released_slots(tmp_path, monkeypatch):
@@ -36,34 +36,31 @@ def test_queue_wakes_for_submissions_and_released_slots(tmp_path, monkeypatch):
     monkeypatch.setenv("TRAINING_CONFIG", str(config_path))
     monkeypatch.delenv("TRAINERD_PROJECTS_CONFIG", raising=False)
     monkeypatch.delenv("TRAINERD_LAN_MODE", raising=False)
-    old_interval = server._queue_poll_interval
-    server._queue_poll_interval = 30
-    try:
-        with TestClient(server.app) as client:
-            time.sleep(0.1)
-            first = client.post("/api/jobs", json={"steps": ["run"], "version": "v1"})
-            deadline = time.monotonic() + 3
-            while time.monotonic() < deadline:
-                if client.get(f"/api/jobs/{first.json()['job_id']}").json()["status"] == "running":
-                    break
-                time.sleep(0.05)
-            assert client.get(f"/api/jobs/{first.json()['job_id']}").json()["status"] == "running"
+    with TestClient(server.app) as client:
+        server._runtime.queue_poll_interval = 30
+        time.sleep(0.1)
+        first = client.post("/api/jobs", json={"steps": ["run"], "version": "v1"})
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if client.get(f"/api/jobs/{first.json()['job_id']}").json()["status"] == "running":
+                break
+            time.sleep(0.05)
+        assert client.get(f"/api/jobs/{first.json()['job_id']}").json()["status"] == "running"
 
-            second = client.post("/api/jobs", json={"steps": ["run"], "version": "v2"})
-            deadline = time.monotonic() + 3
-            while time.monotonic() < deadline:
-                if client.get(f"/api/jobs/{second.json()['job_id']}").json()["status"] == "completed":
-                    break
-                time.sleep(0.05)
-            assert client.get(f"/api/jobs/{second.json()['job_id']}").json()["status"] == "completed"
-    finally:
-        server._queue_poll_interval = old_interval
+        second = client.post("/api/jobs", json={"steps": ["run"], "version": "v2"})
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if client.get(f"/api/jobs/{second.json()['job_id']}").json()["status"] == "completed":
+                break
+            time.sleep(0.05)
+        assert client.get(f"/api/jobs/{second.json()['job_id']}").json()["status"] == "completed"
 
 def test_refresh_config_keeps_running_handle_cancellable(tmp_path):
-    import trainerd.server as server
     import trainerd.runner as runner_module
-    from trainerd.config import load_config
-    from trainerd.runner import JobRunner
+    import trainerd.server as server
+    from trainerd.config import ConfiguredProject, ServerConfig, load_config
+    from trainerd.runner import JobRunner, StageQueuePool
+    from trainerd.runtime import ProjectRuntime
     from trainerd.storage import JobStore
 
     config_path = tmp_path / "training.yaml"
@@ -81,16 +78,27 @@ def test_refresh_config_keeps_running_handle_cancellable(tmp_path):
         return True
     original_terminate = runner_module._terminate_proc_tree
     runner_module._terminate_proc_tree = fake_terminate
-    original = (server._store, server._runner, server._config, server._config_path)
     try:
-        server._store, server._runner, server._config, server._config_path = store, runner, runner._config, config_path
-        server._refresh_runtime_config()
+        project = ProjectRuntime("test", config_path, runner._config, store, runner)
+        server._runtime.configure_projects(
+            ServerConfig(
+                {"test": ConfiguredProject("test", config_path, runner._config)},
+                "test",
+                "",
+                7860,
+                1,
+                False,
+            ),
+            StageQueuePool(),
+            projects={"test": project},
+        )
+        server._runtime.refresh(project)
         assert asyncio.run(runner.cancel_job("job")) is True
         assert captured["proc"] is marker
         assert runner._running_procs["job"] is marker
     finally:
         runner_module._terminate_proc_tree = original_terminate
-        server._store, server._runner, server._config, server._config_path = original
+        server._runtime.reset()
 
 
 def test_run_cmd_requests_new_session_on_posix(monkeypatch):

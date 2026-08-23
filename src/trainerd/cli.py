@@ -20,6 +20,9 @@ from .managed_env import (
     set_managed_env,
     unset_managed_env,
 )
+from .profiles import ProfileError, load_profiles, remove_profile, set_profile
+from .storage import JobStatus
+
 
 def _headers(api_key: str | None) -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
@@ -80,6 +83,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         cpu_concurrency=args.cpu_concurrency,
         gpu_capacity=args.gpu_capacity,
         allowed_repos=args.allow_repo,
+        lan_config=getattr(args, "lan_config", None),
     )
     return 0
 
@@ -137,9 +141,19 @@ def _cmd_env_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_submit(args: argparse.Namespace) -> int:
+    server_url = args.server_url
+    project = args.project
+    if args.profile:
+        profile = load_profiles().get(args.profile)
+        if profile is None:
+            raise ProfileError(f"Unknown client profile: {args.profile}")
+        server_url = server_url or profile["server_url"]
+        project = project or profile["project"]
+    if not server_url:
+        raise ProfileError("submit requires --server-url or --profile")
     payload: dict[str, Any] = {"triggered_by": args.triggered_by}
-    if args.project:
-        payload["project"] = args.project
+    if project:
+        payload["project"] = project
     if args.repo:
         payload["repo"] = args.repo
     if args.task:
@@ -156,12 +170,12 @@ def _cmd_submit(args: argparse.Namespace) -> int:
     if extra_args:
         payload["extra_args"] = extra_args
 
-    result = _request_json("POST", f"{args.server_url.rstrip('/')}/api/jobs", args.api_key, payload)
+    result = _request_json("POST", f"{server_url.rstrip('/')}/api/jobs", args.api_key, payload)
     print(json.dumps(result, indent=2, sort_keys=True), flush=True)
     if not args.wait:
         return 0
     watch_args = argparse.Namespace(
-        server_url=args.server_url,
+        server_url=server_url,
         job_id=result["job_id"],
         api_key=args.api_key,
         poll_seconds=args.poll_seconds,
@@ -171,6 +185,24 @@ def _cmd_submit(args: argparse.Namespace) -> int:
         log_timeout_seconds=args.log_timeout_seconds,
     )
     return _cmd_watch(watch_args)
+
+
+def _cmd_profile_set(args: argparse.Namespace) -> int:
+    set_profile(args.name, args.server_url, args.project)
+    print(f"{args.name} configured")
+    return 0
+
+
+def _cmd_profile_list(_args: argparse.Namespace) -> int:
+    for name, profile in sorted(load_profiles().items()):
+        print(f"{name}\t{profile['server_url']}\t{profile['project']}")
+    return 0
+
+
+def _cmd_profile_remove(args: argparse.Namespace) -> int:
+    existed = remove_profile(args.name)
+    print(f"{args.name} {'removed' if existed else 'was not configured'}")
+    return 0
 
 
 def _cmd_watch(args: argparse.Namespace) -> int:
@@ -192,7 +224,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
                 print(log_text[-args.log_chars :].rstrip(), flush=True)
                 last_log = log_text
         status = job.get("status")
-        if status in {"failed", "promoted", "validated", "completed"}:
+        if JobStatus.is_terminal(status):
             return 0 if status != "failed" else 1
         time.sleep(args.poll_seconds)
 
@@ -249,6 +281,10 @@ def build_parser() -> argparse.ArgumentParser:
             "additional repositories. Requires TRAINERD_API_KEY."
         ),
     )
+    serve.add_argument(
+        "--lan-config",
+        help="Persistent server-owned LAN repository and task configuration.",
+    )
     serve.set_defaults(func=_cmd_serve)
 
     env = sub.add_parser(
@@ -277,7 +313,8 @@ def build_parser() -> argparse.ArgumentParser:
     env_list.set_defaults(func=_cmd_env_list)
 
     submit = sub.add_parser("submit", help="Submit a training job to a running trainerd server")
-    submit.add_argument("--server-url", required=True)
+    submit.add_argument("--server-url")
+    submit.add_argument("--profile", help="Use saved server URL and project defaults.")
     submit.add_argument("--api-key", default=os.environ.get("TRAINERD_API_KEY"))
     submit.add_argument(
         "--project",
@@ -315,6 +352,19 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--log-timeout-seconds", type=int, default=10)
     submit.set_defaults(func=_cmd_submit)
 
+    profile = sub.add_parser("profile", help="Manage non-secret client connection profiles")
+    profile_sub = profile.add_subparsers(dest="profile_command", required=True)
+    profile_set = profile_sub.add_parser("set", help="Create or replace a profile")
+    profile_set.add_argument("name")
+    profile_set.add_argument("--server-url", required=True)
+    profile_set.add_argument("--project", required=True)
+    profile_set.set_defaults(func=_cmd_profile_set)
+    profile_list = profile_sub.add_parser("list", help="List configured profiles")
+    profile_list.set_defaults(func=_cmd_profile_list)
+    profile_remove = profile_sub.add_parser("remove", help="Remove a profile")
+    profile_remove.add_argument("name")
+    profile_remove.set_defaults(func=_cmd_profile_remove)
+
     watch = sub.add_parser("watch", help="Poll job status from a running trainerd server")
     watch.add_argument("--server-url", required=True)
     watch.add_argument("--job-id", required=True)
@@ -342,5 +392,8 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 1
     except ManagedEnvError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except ProfileError as exc:
         print(str(exc), file=sys.stderr)
         return 2

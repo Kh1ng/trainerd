@@ -15,9 +15,17 @@ class JobStatus:
     VALIDATED = "validated"
     PROMOTED = "promoted"
     FAILED = "failed"
+    TERMINAL = frozenset({COMPLETED, VALIDATED, PROMOTED, FAILED})
+
+    @classmethod
+    def is_terminal(cls, status: object) -> bool:
+        """Return whether no more job execution remains for this status."""
+        return status in cls.TERMINAL
 
 
 class JobStore:
+    """Persist job lifecycle state in one SQLite database."""
+
     def __init__(self, db_path: Path, *, read_only: bool = False) -> None:
         self._db = str(db_path)
         self._read_only_uri = f"{db_path.resolve().as_uri()}?mode=ro" if read_only else None
@@ -64,8 +72,9 @@ class JobStore:
             ]:
                 try:
                     conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ctype}")
-                except Exception:
-                    pass
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column name" not in str(exc).lower():
+                        raise
             conn.execute("CREATE INDEX IF NOT EXISTS jobs_created_at ON jobs(created_at)")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS jobs_status_created_at ON jobs(status, created_at)"
@@ -88,6 +97,7 @@ class JobStore:
         stage_queues: dict[str, str] | None = None,
         stage_units: dict[str, int] | None = None,
     ) -> dict:
+        """Create and return a pending job with optional persisted stage queues."""
         now = datetime.now(timezone.utc).isoformat()
         stages = (
             {
@@ -123,23 +133,26 @@ class JobStore:
         return self.get_job(job_id)  # type: ignore[return-value]
 
     def get_job(self, job_id: str, field: str | None = None) -> dict | Any | None:
+        """Return a job, one field, or None when the job does not exist."""
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
         if row is None:
             return None
-        data = dict(row)
-        data["steps"] = json.loads(data["steps"] or "[]")
-        data["stages"] = json.loads(data.get("stages") or "null")
-        if data.get("validation_result"):
+        job = dict(row)
+        job["steps"] = json.loads(job["steps"] or "[]")
+        job["stages"] = json.loads(job.get("stages") or "null")
+        if job.get("validation_result"):
             try:
-                data["validation_result"] = json.loads(data["validation_result"])
-            except Exception:
+                job["validation_result"] = json.loads(job["validation_result"])
+            except json.JSONDecodeError:
+                # Preserve validation output written by older trainerd releases.
                 pass
         if field:
-            return data.get(field)
-        return data
+            return job.get(field)
+        return job
 
     def list_jobs(self, limit: int | None = 20, status: str | None = None, *, oldest_first: bool = False) -> list[dict]:
+        """List jobs by creation time, optionally filtered by status."""
         order = "ASC" if oldest_first else "DESC"
         limit_sql = "" if limit is None else " LIMIT ?"
         with self._connect() as conn:
@@ -174,6 +187,7 @@ class JobStore:
         return [str(row["job_id"]) for row in rows]
 
     def update_job(self, job_id: str, **kwargs: Any) -> None:
+        """Persist selected fields for an existing job."""
         if not kwargs:
             return
         cols = ", ".join(f"{k} = ?" for k in kwargs)
@@ -182,6 +196,7 @@ class JobStore:
             conn.execute(f"UPDATE jobs SET {cols} WHERE job_id = ?", vals)
 
     def set_running(self, job_id: str, step: str) -> None:
+        """Mark a job running at step without replacing its first start time."""
         existing = self.get_job(job_id) or {}
         self.update_job(
             job_id,
@@ -191,6 +206,7 @@ class JobStore:
         )
 
     def set_failed(self, job_id: str, error: str) -> None:
+        """Finish a job as failed and retain a bounded error message."""
         self.update_job(
             job_id,
             status=JobStatus.FAILED,
@@ -199,6 +215,7 @@ class JobStore:
         )
 
     def set_completed(self, job_id: str) -> None:
+        """Finish successful step execution before optional validation."""
         self.update_job(
             job_id,
             status=JobStatus.COMPLETED,
@@ -207,6 +224,7 @@ class JobStore:
         )
 
     def set_stage_running(self, job_id: str, step: str) -> None:
+        """Record stage admission and its queue wait duration."""
         stages = self.get_job(job_id, "stages") or {}
         stage = stages.get(step)
         if stage is None:
@@ -221,6 +239,7 @@ class JobStore:
         self.update_job(job_id, stages=json.dumps(stages))
 
     def set_stage_completed(self, job_id: str, step: str, duration_seconds: float) -> None:
+        """Finish a stage and enqueue the next persisted stage."""
         stages = self.get_job(job_id, "stages") or {}
         stage = stages.get(step)
         if stage is None:
@@ -237,6 +256,7 @@ class JobStore:
         self.update_job(job_id, stages=json.dumps(stages))
 
     def set_stage_failed(self, job_id: str, step: str, error: str) -> None:
+        """Finish one stage as failed with a bounded error message."""
         stages = self.get_job(job_id, "stages") or {}
         stage = stages.get(step)
         if stage is None:
@@ -249,6 +269,7 @@ class JobStore:
         self.update_job(job_id, stages=json.dumps(stages))
 
     def fail_running_stage(self, job_id: str, error: str) -> None:
+        """Fail the currently running persisted stage, if one exists."""
         stages = self.get_job(job_id, "stages") or {}
         for step, stage in stages.items():
             if stage.get("status") == "running":
@@ -272,6 +293,7 @@ class JobStore:
         return interrupted
 
     def set_validated(self, job_id: str, result: dict) -> None:
+        """Record successful validation output for a completed job."""
         self.update_job(
             job_id,
             status=JobStatus.VALIDATED,
@@ -279,6 +301,7 @@ class JobStore:
         )
 
     def set_promoted(self, job_id: str, ref: str) -> None:
+        """Finish a job after promotion and record the resulting Git ref."""
         self.update_job(job_id, status=JobStatus.PROMOTED, promotion_ref=ref)
 
     def set_pending(self, job_id: str) -> None:
