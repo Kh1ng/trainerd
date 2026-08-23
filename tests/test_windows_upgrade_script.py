@@ -127,6 +127,13 @@ def test_upgrade_script_verifies_legacy_lan_policy_without_health_hash() -> None
     assert "Could not verify live LAN policy" in text
     assert "$Expected.allowed_repository_count" in text
     assert "-ExpectedLanPolicy $liveLanPolicy" in text
+    assert "[string]$LegacyLanConfig" in text
+    assert "function Assert-LegacyLanConfig" in text
+    assert "--lan-config" in text
+    assert "LastWriteTimeUtc" in text
+    assert "CreationDate" in text
+    assert "policy-hash" in text
+    assert text.count("-ExpectedLanPolicyHash $liveLanPolicyHash") == 2
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows PowerShell regression")
@@ -137,7 +144,7 @@ def test_legacy_lan_policy_fallback_runs_in_windows_powershell(tmp_path: Path) -
         text.index("function Stop-VerifiedTrainerdListener")
     ]
     live = json.loads(PREVIOUS_LAN_HEALTH.read_text(encoding="utf-8"))
-    candidate = {**live, "version": "0.3.14", "lan_policy_hash": "candidate-hash"}
+    candidate = {**live, "version": "0.3.14", "lan_policy_hash": "reviewed-hash"}
     policy = json.dumps(
         {
             "repositories": [
@@ -155,6 +162,8 @@ def test_legacy_lan_policy_fallback_runs_in_windows_powershell(tmp_path: Path) -
         },
         separators=(",", ":"),
     )
+    legacy_config = tmp_path / "legacy lan.yaml"
+    legacy_config.write_text("version: 1\nrepositories: []\n", encoding="utf-8")
 
     def quoted(value: str) -> str:
         return value.replace("'", "''")
@@ -163,14 +172,43 @@ def test_legacy_lan_policy_fallback_runs_in_windows_powershell(tmp_path: Path) -
     harness.write_text(
         functions
         + f"""
+$configPath = '{quoted(str(legacy_config))}'
+$config = Get-Item -LiteralPath $configPath
+$started = $config.LastWriteTimeUtc.AddSeconds(2)
+function Get-VerifiedTrainerdListenerProcess {{
+    return [pscustomobject]@{{
+        CommandLine = 'trainerd.exe serve --lan --lan-config "' + $config.FullName + '"'
+        CreationDate = $started
+    }}
+}}
+$boundPath = Assert-LegacyLanConfig -ConfigPath $configPath
+if ($boundPath -cne $config.FullName) {{ throw 'Legacy LAN config was not bound.' }}
+$config.LastWriteTimeUtc = $started.AddSeconds(2)
+$rejected = $false
+try {{
+    Assert-LegacyLanConfig -ConfigPath $configPath
+}}
+catch {{
+    $rejected = $true
+}}
+if (-not $rejected) {{ throw 'Changed legacy LAN config was accepted.' }}
 function Get-LanPolicyJson {{ param([string]$BaseUrl) return '{quoted(policy)}' }}
 $live = '{quoted(json.dumps(live))}' | ConvertFrom-Json
 $candidate = '{quoted(json.dumps(candidate))}' | ConvertFrom-Json
-Assert-SamePolicy -Expected $live -Candidate $candidate -ExpectedLanPolicy '{quoted(policy)}' -CandidateBaseUrl 'http://candidate'
+Assert-SamePolicy -Expected $live -Candidate $candidate -ExpectedLanPolicy '{quoted(policy)}' -ExpectedLanPolicyHash 'reviewed-hash' -CandidateBaseUrl 'http://candidate'
+$changedCandidate = '{quoted(json.dumps({**candidate, "lan_policy_hash": "changed-hash"}))}' | ConvertFrom-Json
+$rejected = $false
+try {{
+    Assert-SamePolicy -Expected $live -Candidate $changedCandidate -ExpectedLanPolicy '{quoted(policy)}' -ExpectedLanPolicyHash 'reviewed-hash' -CandidateBaseUrl 'http://candidate'
+}}
+catch {{
+    $rejected = $true
+}}
+if (-not $rejected) {{ throw 'Changed complete LAN policy was accepted.' }}
 function Get-LanPolicyJson {{ param([string]$BaseUrl) return '{{\"repositories\":[]}}' }}
 $rejected = $false
 try {{
-    Assert-SamePolicy -Expected $live -Candidate $candidate -ExpectedLanPolicy '{quoted(policy)}' -CandidateBaseUrl 'http://candidate'
+    Assert-SamePolicy -Expected $live -Candidate $candidate -ExpectedLanPolicy '{quoted(policy)}' -ExpectedLanPolicyHash 'reviewed-hash' -CandidateBaseUrl 'http://candidate'
 }}
 catch {{
     $rejected = $true

@@ -40,6 +40,10 @@ Exact arguments after `trainerd serve` for the isolated candidate probe. Use
 {probe_port} and {probe_state_dir} placeholders where those values belong.
 Quote {probe_state_dir}; the helper preserves the caller's quoting.
 
+.PARAMETER LegacyLanConfig
+Path to the LAN config that the legacy daemon loaded. This value is required
+when the legacy health response omits `lan_policy_hash` and uses server tasks.
+
 .PARAMETER TaskName
 Name of the Scheduled Task that runs the daemon (default: trainerd-lan).
 
@@ -85,7 +89,8 @@ param(
     [string]$InstallRoot = "C:\ProgramData\trainerd",
     [string]$HealthUrl = "http://127.0.0.1:7860",
     [int]$ProbePort = 7861,
-    [string]$ProbeStateDir = ""
+    [string]$ProbeStateDir = "",
+    [string]$LegacyLanConfig = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -175,6 +180,7 @@ function Assert-SamePolicy {
         [object]$Expected,
         [object]$Candidate,
         [string]$ExpectedLanPolicy,
+        [string]$ExpectedLanPolicyHash,
         [string]$CandidateBaseUrl
     )
     $fields = @("mode", "authentication_required")
@@ -210,6 +216,51 @@ function Assert-SamePolicy {
             throw "Candidate LAN repository policy does not match the live daemon."
         }
     }
+    if (
+        $ExpectedLanPolicyHash -and
+        $ExpectedLanPolicyHash -cne [string]$Candidate.lan_policy_hash
+    ) {
+        throw "Candidate complete LAN policy does not match the legacy daemon config."
+    }
+}
+
+function Get-VerifiedTrainerdListenerProcess {
+    $listenPort = ([uri]$HealthUrl).Port
+    $listenerPids = @(
+        Get-NetTCPConnection -LocalPort $listenPort -State Listen -ErrorAction Stop |
+            Select-Object -ExpandProperty OwningProcess -Unique
+    )
+    if ($listenerPids.Count -ne 1) {
+        return $null
+    }
+    $listenerPid = [int]$listenerPids[0]
+    $process = Get-CimInstance Win32_Process -Filter "ProcessId = $listenerPid"
+    if (
+        -not $process -or
+        $process.CommandLine -notmatch '(?i)trainerd' -or
+        $process.CommandLine -notmatch '(?i)(^|\s)serve(\s|$)'
+    ) {
+        return $null
+    }
+    return $process
+}
+
+function Assert-LegacyLanConfig {
+    param([string]$ConfigPath)
+    $config = Get-Item -LiteralPath $ConfigPath -ErrorAction Stop
+    $process = Get-VerifiedTrainerdListenerProcess
+    if (-not $process) {
+        throw "Could not identify the live trainerd listener."
+    }
+    $pathPattern = '(?i)(?:^|\s)--lan-config(?:=|\s+)(?:"{0}"|{0})(?=\s|$)' -f [regex]::Escape($config.FullName)
+    if ($process.CommandLine -notmatch $pathPattern) {
+        throw "The live trainerd process did not load LegacyLanConfig."
+    }
+    $startedUtc = ([datetime]$process.CreationDate).ToUniversalTime()
+    if ($config.LastWriteTimeUtc -gt $startedUtc) {
+        throw "LegacyLanConfig changed after the live trainerd process started."
+    }
+    return $config.FullName
 }
 
 function Stop-VerifiedTrainerdListener {
@@ -224,23 +275,11 @@ function Stop-VerifiedTrainerdListener {
         return $false
     }
 
-    $listenPort = ([uri]$HealthUrl).Port
-    $listenerPids = @(
-        Get-NetTCPConnection -LocalPort $listenPort -State Listen -ErrorAction Stop |
-            Select-Object -ExpandProperty OwningProcess -Unique
-    )
-    if ($listenerPids.Count -ne 1) {
+    $process = Get-VerifiedTrainerdListenerProcess
+    if (-not $process) {
         return $false
     }
-    $listenerPid = [int]$listenerPids[0]
-    $process = Get-CimInstance Win32_Process -Filter "ProcessId = $listenerPid"
-    if (
-        -not $process -or
-        $process.CommandLine -notmatch '(?i)trainerd' -or
-        $process.CommandLine -notmatch '(?i)(^|\s)serve(\s|$)'
-    ) {
-        return $false
-    }
+    $listenerPid = [int]$process.ProcessId
     Stop-Process -Id $listenerPid -Force -ErrorAction Stop
     return $true
 }
@@ -303,6 +342,8 @@ if ($queue.Pending -gt 0 -or $queue.Running -gt 0) {
 }
 Write-Host "Queue is empty (pending=$($queue.Pending) running=$($queue.Running))."
 $liveLanPolicy = $null
+$liveLanPolicyHash = ""
+$legacyLanConfigPath = ""
 if (
     $live.mode -eq "lan" -and
     [string]::IsNullOrWhiteSpace([string]$live.lan_policy_hash)
@@ -315,6 +356,17 @@ if (
     }
     if (-not $liveLanPolicy) {
         throw "Could not verify live LAN policy. Set TRAINERD_API_KEY and retry."
+    }
+    $publicPolicy = $liveLanPolicy | ConvertFrom-Json
+    $usesServerTasks = @(
+        $publicPolicy.repositories |
+            Where-Object { $_.task_source -eq "server_config" }
+    ).Count -gt 0
+    if ($usesServerTasks) {
+        if ([string]::IsNullOrWhiteSpace($LegacyLanConfig)) {
+            throw "LegacyLanConfig is required to verify legacy server tasks."
+        }
+        $legacyLanConfigPath = Assert-LegacyLanConfig -ConfigPath $LegacyLanConfig
     }
 }
 
@@ -334,6 +386,13 @@ if (-not (Test-Path $pythonExe)) {
 if ($LASTEXITCODE -ne 0) { throw "pip install failed for $WheelUrl" }
 & $trainerdExe --version
 if ($LASTEXITCODE -ne 0) { throw "Candidate trainerd.exe did not run" }
+if ($legacyLanConfigPath) {
+    $liveLanPolicyHash = (& $trainerdExe policy-hash --lan-config $legacyLanConfigPath | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $liveLanPolicyHash -notmatch '^[0-9a-f]{64}$') {
+        throw "Candidate could not hash LegacyLanConfig."
+    }
+    $legacyLanConfigPath = Assert-LegacyLanConfig -ConfigPath $legacyLanConfigPath
+}
 
 # 3. Probe the candidate on an alternate port with an isolated state dir. The
 #    probe always runs in a unique subdirectory so it can never touch, let
@@ -371,6 +430,7 @@ try {
         -Expected $live `
         -Candidate $candidateHealth `
         -ExpectedLanPolicy $liveLanPolicy `
+        -ExpectedLanPolicyHash $liveLanPolicyHash `
         -CandidateBaseUrl $probeHealth
     Write-Host "Candidate probe healthy."
 }
@@ -442,6 +502,7 @@ if ($verified) {
             -Expected $live `
             -Candidate $installedHealth `
             -ExpectedLanPolicy $liveLanPolicy `
+            -ExpectedLanPolicyHash $liveLanPolicyHash `
             -CandidateBaseUrl $HealthUrl
     }
     catch {
