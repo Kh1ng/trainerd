@@ -1,0 +1,12 @@
+{
+  "status": "ok",
+  "version": "0.3.13",
+  "project": "lan-0123456789abcdef0123-train",
+  "projects": ["lan-0123456789abcdef0123-train"],
+  "default_project": "lan-0123456789abcdef0123-train",
+  "mode": "lan",
+  "pending_jobs": 0,
+  "running_jobs": 0,
+  "authentication_required": true,
+  "allowed_repository_count": 2
+}

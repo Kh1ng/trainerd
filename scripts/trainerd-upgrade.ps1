@@ -150,14 +150,41 @@ function Get-QueueState {
     }
 }
 
+function Get-LanPolicyJson {
+    param([string]$BaseUrl)
+    $headers = @{}
+    if (-not [string]::IsNullOrWhiteSpace($env:TRAINERD_API_KEY)) {
+        $headers["X-API-Key"] = $env:TRAINERD_API_KEY.Trim()
+    }
+    try {
+        $base = $BaseUrl.TrimEnd("/")
+        $policy = Invoke-RestMethod `
+            -Uri "$base/api/lan/config" `
+            -Method Get `
+            -Headers $headers `
+            -TimeoutSec 15
+        return $policy | ConvertTo-Json -Compress -Depth 10
+    }
+    catch {
+        return $null
+    }
+}
+
 function Assert-SamePolicy {
     param(
         [object]$Expected,
-        [object]$Candidate
+        [object]$Candidate,
+        [string]$ExpectedLanPolicy,
+        [string]$CandidateBaseUrl
     )
     $fields = @("mode", "authentication_required")
     if ($Expected.mode -eq "lan") {
-        $fields += "lan_policy_hash"
+        if ($ExpectedLanPolicy) {
+            $fields += "allowed_repository_count"
+        }
+        else {
+            $fields += "lan_policy_hash"
+        }
     }
     else {
         $fields += "projects"
@@ -167,6 +194,20 @@ function Assert-SamePolicy {
         $candidateValue = $Candidate.$field | ConvertTo-Json -Compress
         if ($expectedValue -cne $candidateValue) {
             throw "Candidate policy mismatch for $field (live=$expectedValue candidate=$candidateValue)."
+        }
+    }
+    if ($ExpectedLanPolicy) {
+        if ([int]$Expected.allowed_repository_count -eq 0) {
+            $candidateLanPolicy = '{"repositories":[]}'
+        }
+        else {
+            $candidateLanPolicy = Get-LanPolicyJson -BaseUrl $CandidateBaseUrl
+        }
+        if (-not $candidateLanPolicy) {
+            throw "Could not verify candidate LAN policy at $CandidateBaseUrl."
+        }
+        if ($ExpectedLanPolicy -cne $candidateLanPolicy) {
+            throw "Candidate LAN repository policy does not match the live daemon."
         }
     }
 }
@@ -261,6 +302,21 @@ if ($queue.Pending -gt 0 -or $queue.Running -gt 0) {
     throw "Refusing cutover: $($queue.Pending) pending and $($queue.Running) running jobs. Wait for the queue to drain."
 }
 Write-Host "Queue is empty (pending=$($queue.Pending) running=$($queue.Running))."
+$liveLanPolicy = $null
+if (
+    $live.mode -eq "lan" -and
+    [string]::IsNullOrWhiteSpace([string]$live.lan_policy_hash)
+) {
+    if ([int]$live.allowed_repository_count -eq 0) {
+        $liveLanPolicy = '{"repositories":[]}'
+    }
+    else {
+        $liveLanPolicy = Get-LanPolicyJson -BaseUrl $HealthUrl
+    }
+    if (-not $liveLanPolicy) {
+        throw "Could not verify live LAN policy. Set TRAINERD_API_KEY and retry."
+    }
+}
 
 # 2. Install the candidate in a fresh versioned virtual environment. A stale
 #    environment from an interrupted run is rebuilt rather than reused.
@@ -311,7 +367,11 @@ try {
         throw "Candidate did not reach status=ok version=$Version on port $ProbePort. See $probeOutputLog and $probeErrorLog"
     }
     $candidateHealth = Get-HealthJson -BaseUrl $probeHealth
-    Assert-SamePolicy -Expected $live -Candidate $candidateHealth
+    Assert-SamePolicy `
+        -Expected $live `
+        -Candidate $candidateHealth `
+        -ExpectedLanPolicy $liveLanPolicy `
+        -CandidateBaseUrl $probeHealth
     Write-Host "Candidate probe healthy."
 }
 finally {
@@ -378,7 +438,11 @@ $verified = Wait-For-Health -BaseUrl $HealthUrl -ExpectedVersion $Version
 if ($verified) {
     try {
         $installedHealth = Get-HealthJson -BaseUrl $HealthUrl
-        Assert-SamePolicy -Expected $live -Candidate $installedHealth
+        Assert-SamePolicy `
+            -Expected $live `
+            -Candidate $installedHealth `
+            -ExpectedLanPolicy $liveLanPolicy `
+            -CandidateBaseUrl $HealthUrl
     }
     catch {
         Write-Warning "Installed daemon policy verification failed: $_"
