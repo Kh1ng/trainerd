@@ -330,7 +330,10 @@ class JobRunner:
                             )
                             duration = time.perf_counter() - started
                     except asyncio.CancelledError:
-                        if self._store.get_job(job_id, "stages")[step.id]["status"] == "running":
+                        stage = (self._store.get_job(job_id, "stages") or {}).get(
+                            step.id, {}
+                        )
+                        if stage.get("status") == "running":
                             self._store.set_stage_failed(job_id, step.id, "Cancelled via API")
                         raise
                 else:
