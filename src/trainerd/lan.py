@@ -6,11 +6,13 @@ provide commands or filesystem paths.
 """
 from __future__ import annotations
 
+import errno
 import getpass
 import hashlib
 import os
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -435,7 +437,6 @@ def _require_writable_checkout(checkout: Path) -> None:
     instead of relying on the root or on permission bits.
     """
     git_dir = checkout / ".git"
-    service = getpass.getuser()
     problems: list[str] = []
     if not _probe_writable_dir(git_dir):
         problems.append(f"Git metadata root is not writable: {git_dir}")
@@ -454,6 +455,10 @@ def _require_writable_checkout(checkout: Path) -> None:
         if directory.is_dir() and not _probe_writable_dir(directory):
             problems.append(f"Git metadata directory is not writable: {relative}")
     if problems:
+        try:
+            service = getpass.getuser()
+        except KeyError:
+            service = f"uid {os.getuid()}" if hasattr(os, "getuid") else "unknown"
         raise LanConfigError(
             f"Managed checkout Git metadata is not writable by the current "
             f"service identity {service!r}: {checkout} ({'; '.join(problems)}). "
@@ -475,24 +480,26 @@ def _probe_appendable(path: Path) -> bool:
     """Check write permission by opening append-only; no content is written."""
     try:
         fd = os.open(path, os.O_WRONLY | os.O_APPEND)
-    except OSError:
+    except OSError as exc:
+        if exc.errno == errno.ENOENT or getattr(exc, "winerror", None) in {32, 33}:
+            return True
         return False
-    os.close(fd)
-    return True
+    try:
+        return True
+    finally:
+        os.close(fd)
 
 
 def _probe_writable_dir(path: Path) -> bool:
     """Check that a new entry can be created in a directory."""
-    probe = path / f".trainerd-write-probe-{os.getpid()}"
     try:
-        fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        probe = tempfile.TemporaryFile(prefix=".trainerd-write-probe-", dir=path)
     except OSError:
         return False
-    os.close(fd)
     try:
-        probe.unlink()
+        probe.close()
     except OSError:
-        return False
+        pass
     return True
 
 

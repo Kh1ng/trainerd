@@ -5,6 +5,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,6 +19,9 @@ from trainerd.config import StepConfig
 from trainerd.lan import (
     LanConfigError,
     LanPreparedProject,
+    _probe_appendable,
+    _probe_writable_dir,
+    _require_writable_checkout,
     load_lan_task,
     normalize_branch,
     normalize_repo_url,
@@ -679,3 +683,49 @@ def test_prepare_lan_project_probes_existing_reflog_writability(tmp_path: Path) 
     assert "Reflog is not writable" in message
     assert "logs/refs/remotes" in message
     assert "service identity" in message
+
+
+def test_writable_directory_probe_is_unique_and_cleanup_tolerant(
+    tmp_path: Path,
+) -> None:
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        assert all(pool.map(_probe_writable_dir, [tmp_path] * 32))
+    assert list(tmp_path.iterdir()) == []
+
+    class FailedCleanup:
+        def close(self) -> None:
+            raise OSError("cleanup failed")
+
+    with patch("trainerd.lan.tempfile.TemporaryFile", return_value=FailedCleanup()):
+        assert _probe_writable_dir(tmp_path)
+
+
+def test_reflog_probe_ignores_disappearance_and_windows_sharing(
+    tmp_path: Path,
+) -> None:
+    with patch(
+        "trainerd.lan.os.open",
+        side_effect=FileNotFoundError(2, "No such file or directory"),
+    ):
+        assert _probe_appendable(tmp_path / "gone")
+
+    sharing_violation = OSError("sharing violation")
+    sharing_violation.winerror = 32  # type: ignore[attr-defined]
+    with patch("trainerd.lan.os.open", side_effect=sharing_violation):
+        assert _probe_appendable(tmp_path / "busy")
+
+    with patch("trainerd.lan.os.open", return_value=123), patch(
+        "trainerd.lan.os.close"
+    ) as close:
+        assert _probe_appendable(tmp_path / "reflog")
+        close.assert_called_once_with(123)
+
+
+def test_writable_checkout_handles_unknown_service_user(tmp_path: Path) -> None:
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    with patch("trainerd.lan._probe_writable_dir", return_value=False), patch(
+        "trainerd.lan.getpass.getuser", side_effect=KeyError
+    ):
+        with pytest.raises(LanConfigError, match=r"service identity '(uid \d+|unknown)'"):
+            _require_writable_checkout(checkout)
