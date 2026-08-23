@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 
 import pytest
 
@@ -37,6 +38,44 @@ except ImportError:
 from trainerd.config import RepoConfig, StepConfig, TrainingConfig
 from trainerd.runner import JobRunner, RepoSyncError, _config_for_job, _resolve_template, _sync_repo_checkout, _with_repo_pythonpath
 from trainerd.storage import JobStore
+
+
+def test_workspace_operation_preserves_cancellation_when_worker_fails(
+    tmp_path: Path,
+) -> None:
+    config = TrainingConfig(
+        project="test",
+        repo=RepoConfig("", "main", str(tmp_path)),
+        work_dir=tmp_path / "work",
+        steps=[],
+        validation=None,
+        promotion=None,
+        api_key="",
+        server_port=7860,
+        log_dir=tmp_path / "logs",
+    )
+    runner = JobRunner(JobStore(tmp_path / "jobs.db"), config)
+    started = threading.Event()
+    finish = threading.Event()
+
+    def fail_after_cancellation() -> None:
+        started.set()
+        finish.wait(timeout=1)
+        raise RepoSyncError("workspace failed")
+
+    async def exercise() -> None:
+        operation = asyncio.create_task(
+            runner._workspace_operation(fail_after_cancellation)
+        )
+        while not started.is_set():
+            await asyncio.sleep(0)
+        operation.cancel()
+        await asyncio.sleep(0)
+        finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+
+    asyncio.run(exercise())
 
 
 def test_resolve_markets_flag_populated() -> None:

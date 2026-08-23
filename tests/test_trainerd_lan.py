@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import pytest
 import yaml
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import trainerd.server as server
@@ -489,7 +490,12 @@ def test_server_owned_task_survives_pinned_checkout_reload(tmp_path: Path) -> No
     assert prepared.config.lan_task_definition_hash == expected_hash
     pinned = tmp_path / "pinned"
     pinned.mkdir()
-    reloaded = load_lan_job_config(prepared.config, pinned, branch="main")
+    reloaded = load_lan_job_config(
+        prepared.config,
+        pinned,
+        branch="main",
+        task_definition_hash=expected_hash,
+    )
     assert reloaded.lan_task_source == "server_config"
     assert reloaded.steps[0].cmd == prepared.config.steps[0].cmd
     assert reloaded.lan_task_definition_hash == expected_hash
@@ -499,10 +505,51 @@ def test_server_owned_task_survives_pinned_checkout_reload(tmp_path: Path) -> No
     submitted = server._queue_job(runtime, {"version": "v1"})
     assert runtime.store.get_job(submitted["job_id"])["task_definition_hash"] == expected_hash
     assert prepared.config.lan_task_definition is not None
-    prepared.config.lan_task_definition["steps"][0]["cmd"] = "changed"
+    changed_definition = {
+        **prepared.config.lan_task_definition,
+        "steps": [{"id": "run", "cmd": "changed", "cwd": "."}],
+    }
+    changed_hash = hashlib.sha256(
+        json.dumps(
+            changed_definition,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    changed_config = replace(
+        prepared.config,
+        lan_task_definition=changed_definition,
+        lan_task_definition_hash=changed_hash,
+    )
     with pytest.raises(LanConfigError, match="changed after submission"):
-        load_lan_job_config(prepared.config, pinned, branch="main")
+        load_lan_job_config(
+            changed_config,
+            pinned,
+            branch="main",
+            task_definition_hash=runtime.store.get_job(
+                submitted["job_id"], "task_definition_hash"
+            ),
+        )
     server._runtime.reset()
+
+
+def test_lan_request_reports_invalid_runtime_allowlist_as_bad_request(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    server._runtime.configure_lan(tmp_path / "state", 1, server.StageQueuePool())
+    monkeypatch.setenv("TRAINERD_ALLOWED_REPOS", "not a repository URL")
+    try:
+        with pytest.raises(HTTPException) as error:
+            asyncio.run(
+                server._prepare_lan_runtime(
+                    {"repo": "http://git.local/team/repo.git", "task": "train"}
+                )
+            )
+        assert error.value.status_code == 400
+    finally:
+        server._runtime.reset()
 
 
 def test_lan_post_repo_and_task_installs_runtime_and_queues_job(
@@ -886,11 +933,12 @@ def test_writable_directory_probe_is_unique_and_cleanup_tolerant(
         assert all(pool.map(_probe_writable_dir, [tmp_path] * 32))
     assert list(tmp_path.iterdir()) == []
 
-    class FailedCleanup:
-        def close(self) -> None:
-            raise OSError("cleanup failed")
-
-    with patch("trainerd.lan.tempfile.TemporaryFile", return_value=FailedCleanup()):
+    probe = tmp_path / ".trainerd-write-probe-failed"
+    probe.mkdir()
+    with patch("trainerd.lan.tempfile.mkdtemp", return_value=str(probe)), patch(
+        "trainerd.lan.tempfile.TemporaryFile",
+        side_effect=AssertionError("directory probe must not retain a file handle"),
+    ), patch("trainerd.lan.Path.rmdir", side_effect=OSError("cleanup failed")):
         assert _probe_writable_dir(tmp_path)
 
 

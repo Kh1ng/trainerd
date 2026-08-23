@@ -222,6 +222,30 @@ def test_run_job_wrapper_propagates_cancellation(tmp_path: Path, monkeypatch) ->
         _restore_trainerd_server(old_state)
 
 
+def test_run_job_wrapper_always_releases_queue_reservation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client, old_state = _configure_trainerd_server(tmp_path)
+    job_id = "job-lookup-failed"
+    server_mod._runtime.running_tasks[job_id] = object()  # type: ignore[assignment]
+    woke: list[bool] = []
+    monkeypatch.setattr(
+        server_mod._runtime,
+        "find_job",
+        lambda _job_id: (_ for _ in ()).throw(RuntimeError("lookup failed")),
+    )
+    monkeypatch.setattr(server_mod._runtime, "wake_queue", lambda: woke.append(True))
+    try:
+        with pytest.raises(RuntimeError, match="lookup failed"):
+            asyncio.run(server_mod._run_job_wrapper(job_id))
+        assert job_id not in server_mod._runtime.running_tasks
+        assert woke == [True]
+    finally:
+        client.close()
+        _restore_trainerd_server(old_state)
+
+
 def test_trainerd_submit_persists_stage_queue_handoff(tmp_path: Path) -> None:
     client, old_state = _configure_trainerd_server(tmp_path)
     try:

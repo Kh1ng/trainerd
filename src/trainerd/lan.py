@@ -288,6 +288,7 @@ def load_lan_job_config(
     checkout: Path,
     *,
     branch: str,
+    task_definition_hash: str | None,
 ) -> TrainingConfig:
     """Load a LAN task from its pinned job checkout using daemon-owned paths."""
     normalized_url = normalize_repo_url(current.repo.url)
@@ -323,7 +324,7 @@ def load_lan_job_config(
             log_dir=current.log_dir,
             source="server_config",
         )
-        if config.lan_task_definition_hash != current.lan_task_definition_hash:
+        if config.lan_task_definition_hash != task_definition_hash:
             raise LanConfigError("Server-owned LAN task definition changed after submission")
     inject_managed_env(config, state_dir)
     return config
@@ -626,13 +627,13 @@ def _probe_appendable(path: Path) -> bool:
 def _probe_writable_dir(path: Path) -> bool:
     """Check that a new entry can be created in a directory."""
     try:
-        probe = tempfile.TemporaryFile(prefix=".trainerd-write-probe-", dir=path)
+        probe = Path(tempfile.mkdtemp(prefix=".trainerd-write-probe-", dir=path))
     except OSError:
         return False
     try:
-        probe.close()
+        probe.rmdir()
     except OSError:
-        # Creation proved writability; close cleanup can fail independently.
+        # Creation proved writability; removal can fail independently.
         pass
     return True
 

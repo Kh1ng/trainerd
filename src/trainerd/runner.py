@@ -152,7 +152,7 @@ class JobRunner:
             try:
                 await asyncio.shield(task)
             except asyncio.CancelledError:
-                await task
+                await asyncio.gather(task, return_exceptions=True)
                 raise
 
     def _load_current_config(self) -> TrainingConfig:
@@ -201,6 +201,7 @@ class JobRunner:
                     config,
                     checkout,
                     branch=job.get("branch") or config.repo.branch,
+                    task_definition_hash=job.get("task_definition_hash"),
                 )
             except LanConfigError as exc:
                 self._store.set_failed(job_id, f"Pinned task config failed: {exc}")
