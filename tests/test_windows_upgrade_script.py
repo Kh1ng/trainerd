@@ -44,6 +44,13 @@ def test_upgrade_script_installs_fresh_versioned_venv_and_probes_alternate_port(
     assert "probe-" in text
 
 
+def test_upgrade_script_uses_distinct_probe_output_streams() -> None:
+    text = _script_text()
+    assert "-RedirectStandardOutput $probeOutputLog" in text
+    assert "-RedirectStandardError $probeErrorLog" in text
+    assert "$probeOutputLog and $probeErrorLog" in text
+
+
 def test_upgrade_script_probe_state_cannot_touch_live_state() -> None:
     text = _script_text()
     assert "ProbeStateDir must be outside the live StateDir" in text

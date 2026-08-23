@@ -189,18 +189,19 @@ if (
 $probeDir = Join-Path $probeBase ("probe-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
 Write-Host "Probing candidate on port $ProbePort with isolated state $probeDir ..."
-$probeLog = Join-Path $logDir "probe-$Version.log"
+$probeOutputLog = Join-Path $logDir "probe-$Version.stdout.log"
+$probeErrorLog = Join-Path $logDir "probe-$Version.stderr.log"
 $probeHealth = "http://127.0.0.1:$ProbePort"
 $probeProcess = Start-Process -FilePath $trainerdExe `
     -ArgumentList @("serve", "--lan", "--state-dir", "`"$probeDir`"", "--host", "127.0.0.1", "--port", "$ProbePort") `
-    -RedirectStandardOutput $probeLog `
-    -RedirectStandardError $probeLog `
+    -RedirectStandardOutput $probeOutputLog `
+    -RedirectStandardError $probeErrorLog `
     -PassThru `
     -WindowStyle Hidden
 try {
     $healthy = Wait-For-Health -BaseUrl $probeHealth -ExpectedVersion $Version
     if (-not $healthy) {
-        throw "Candidate did not reach status=ok version=$Version on port $ProbePort. See $probeLog"
+        throw "Candidate did not reach status=ok version=$Version on port $ProbePort. See $probeOutputLog and $probeErrorLog"
     }
     Write-Host "Candidate probe healthy."
 }

@@ -35,7 +35,7 @@ except ImportError:
                 sys.path.insert(0, str(_ROOT.parent))
 
 from trainerd.config import RepoConfig, StepConfig, TrainingConfig
-from trainerd.runner import JobRunner, RepoSyncError, _resolve_template, _sync_repo_checkout, _with_repo_pythonpath
+from trainerd.runner import JobRunner, RepoSyncError, _config_for_job, _resolve_template, _sync_repo_checkout, _with_repo_pythonpath
 from trainerd.storage import JobStore
 
 
@@ -119,6 +119,35 @@ def test_with_repo_pythonpath_dedupes_repo_path() -> None:
     existing = os.pathsep.join(["/repo", "/other"])
     env = _with_repo_pythonpath("/repo", {"PYTHONPATH": existing})
     assert env["PYTHONPATH"] == existing
+
+
+def test_job_config_binds_work_dir_when_repo_is_its_parent(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    base_work = repo / "work"
+    job_work = tmp_path / "jobs" / "job-123"
+    config = TrainingConfig(
+        project="test",
+        repo=RepoConfig("", "main", str(repo)),
+        work_dir=base_work,
+        steps=[
+            StepConfig(
+                "run",
+                "Run",
+                f"run --repo {repo} --work {base_work}",
+                cwd=str(base_work),
+            )
+        ],
+        validation=None,
+        promotion=None,
+        api_key="",
+        server_port=7860,
+        log_dir=tmp_path / "logs",
+    )
+
+    bound = _config_for_job(config, job_work)
+
+    assert bound.steps[0].cmd == f"run --repo {repo} --work {job_work}"
+    assert bound.steps[0].cwd == str(job_work)
 
 
 def test_runner_exports_managed_artifact_location(tmp_path: Path, monkeypatch) -> None:
