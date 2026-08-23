@@ -373,11 +373,10 @@ Interactive OpenAPI documentation is available at `/docs`.
 ## Windows daemon
 
 Install `trainerd` in a dedicated daemon virtual environment, separate from all
-project virtual environments:
+project virtual environments. Use the pip version bundled with Python 3.12:
 
 ```powershell
 py -3.12 -m venv C:\ProgramData\trainerd\venvs\0.3.4
-C:\ProgramData\trainerd\venvs\0.3.4\Scripts\python.exe -m pip install --upgrade pip
 C:\ProgramData\trainerd\venvs\0.3.4\Scripts\python.exe -m pip install `
   https://github.com/Kh1ng/trainerd/releases/download/v0.3.4/trainerd-0.3.4-py3-none-any.whl
 C:\ProgramData\trainerd\venvs\0.3.4\Scripts\trainerd.exe --version

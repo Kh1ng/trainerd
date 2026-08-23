@@ -260,8 +260,6 @@ if ($LASTEXITCODE -ne 0) { throw "Virtual environment creation failed: $venvDir"
 if (-not (Test-Path $pythonExe)) {
     throw "Virtual environment was not created: $pythonExe"
 }
-& $pythonExe -m pip install --upgrade pip
-if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed for $venvDir" }
 & $pythonExe -m pip install $WheelUrl
 if ($LASTEXITCODE -ne 0) { throw "pip install failed for $WheelUrl" }
 & $trainerdExe --version
