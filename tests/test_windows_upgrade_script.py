@@ -119,9 +119,11 @@ def test_upgrade_script_preserves_prior_action_and_restores_on_failure() -> None
 
 def test_upgrade_script_rollback_verifies_prior_version() -> None:
     text = _script_text()
+    restore = text.split("function Restore-PriorAction", 1)[1].split("# 1.", 1)[0]
     assert "$priorVersion" in text
     assert "ExpectedVersion $priorVersion" in text
     assert "did not return to prior version" in text
+    assert "Stop-DaemonTask -ExpectedVersion $ExpectedVersion" in restore
 
 
 def test_upgrade_script_restarts_prior_task_if_action_switch_fails() -> None:
@@ -130,6 +132,16 @@ def test_upgrade_script_restarts_prior_task_if_action_switch_fails() -> None:
 
     assert "Start-ScheduledTask -TaskName $TaskName" in failure_branch
     assert "Wait-For-Health -BaseUrl $HealthUrl -ExpectedVersion $priorVersion" in failure_branch
+
+
+def test_upgrade_script_preserves_caller_quoting_for_probe_state() -> None:
+    text = _script_text()
+
+    assert '.Replace("{probe_state_dir}", "$probeDir")' in text
+    template = '--state-dir "{probe_state_dir}"'
+    assert template.replace("{probe_state_dir}", r"C:\Program Data\trainerd") == (
+        '--state-dir "C:\\Program Data\\trainerd"'
+    )
 
 
 def test_upgrade_script_appends_versioned_startup_logs() -> None:

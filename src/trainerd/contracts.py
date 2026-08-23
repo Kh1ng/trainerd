@@ -82,6 +82,10 @@ def validate_payload(payload: dict[str, Any], schema: dict[str, Any] = JOB_PAYLO
             problems.append(f"missing required field: {key}")
     _types = {"string": str, "boolean": bool, "integer": int, "array": list, "object": dict}
     for key, spec in props.items():
+        if key in payload and payload[key] is None and any(
+            choice.get("type") == "null" for choice in spec.get("anyOf", [])
+        ):
+            continue
         value_schema = spec
         if spec.get("type") is None:
             non_null = [
