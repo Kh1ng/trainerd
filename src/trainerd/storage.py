@@ -69,6 +69,7 @@ class JobStore:
                 ("extra_args", "TEXT"),
                 ("stages", "TEXT"),
                 ("repo_sha", "TEXT"),
+                ("task_definition_hash", "TEXT"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ctype}")
@@ -94,6 +95,7 @@ class JobStore:
         markets: str | None = None,
         extra_args: str | None = None,
         repo_sha: str | None = None,
+        task_definition_hash: str | None = None,
         stage_queues: dict[str, str] | None = None,
         stage_units: dict[str, int] | None = None,
     ) -> dict:
@@ -114,8 +116,8 @@ class JobStore:
         )
         with self._connect() as conn:
             conn.execute(
-                """INSERT INTO jobs (job_id, status, version, steps, triggered_by, created_at, branch, markets, extra_args, repo_sha, stages)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO jobs (job_id, status, version, steps, triggered_by, created_at, branch, markets, extra_args, repo_sha, task_definition_hash, stages)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     job_id,
                     JobStatus.PENDING,
@@ -127,6 +129,7 @@ class JobStore:
                     markets,
                     extra_args,
                     repo_sha,
+                    task_definition_hash,
                     json.dumps(stages) if stages else None,
                 ),
             )

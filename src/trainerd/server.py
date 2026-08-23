@@ -459,6 +459,7 @@ def _queue_job(runtime: ProjectRuntime, payload: dict[str, Any]) -> dict:
         markets=markets,
         extra_args=extra_args,
         repo_sha=repo_sha,
+        task_definition_hash=config.lan_task_definition_hash,
         stage_queues={step.id: step.queue for step in config.steps if step.id in steps}
         if config.steps and all(step.queue for step in config.steps)
         else None,

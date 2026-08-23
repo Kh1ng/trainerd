@@ -10,6 +10,7 @@ import copy
 import errno
 import getpass
 import hashlib
+import json
 import os
 import subprocess
 import tempfile
@@ -322,6 +323,8 @@ def load_lan_job_config(
             log_dir=current.log_dir,
             source="server_config",
         )
+        if config.lan_task_definition_hash != current.lan_task_definition_hash:
+            raise LanConfigError("Server-owned LAN task definition changed after submission")
     inject_managed_env(config, state_dir)
     return config
 
@@ -448,6 +451,19 @@ def _load_lan_task_definitions(
         64,
         f"task {task!r} max_concurrent_jobs",
     )
+    task_definition = copy.deepcopy(task_raw) if source == "server_config" else None
+    task_definition_hash = (
+        hashlib.sha256(
+            json.dumps(
+                task_definition,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        if task_definition is not None
+        else None
+    )
     return TrainingConfig(
         project=project,
         repo=RepoConfig(repo_url, branch, str(repo_root), sync_before_job=True),
@@ -461,7 +477,8 @@ def _load_lan_task_definitions(
         max_concurrent_jobs=max_jobs,
         required_env=tuple(required_env),
         lan_task_source=source,
-        lan_task_definition=copy.deepcopy(task_raw) if source == "server_config" else None,
+        lan_task_definition=task_definition,
+        lan_task_definition_hash=task_definition_hash,
     )
 
 

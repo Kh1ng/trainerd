@@ -76,7 +76,9 @@ repositories:
 ```
 
 The first entry loads tasks from `.trainerd.yaml`. The second entry uses only
-the tasks in the server file. Start the daemon with this file:
+the tasks in the server file. Each submitted server-owned task keeps its
+reviewed definition and records its SHA-256 hash with the job. Start the daemon
+with this file:
 
 ```powershell
 $env:TRAINERD_API_KEY = "replace-with-a-long-random-secret"
