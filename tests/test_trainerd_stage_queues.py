@@ -279,6 +279,44 @@ def test_gpu_capacity_recovers_after_cancellation_failure_and_restart() -> None:
     assert StageQueuePool(gpu=2).snapshot()["gpu"]["claimed"] == 0
 
 
+def test_stage_cancellation_survives_missing_stage_state(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = TrainingConfig(
+        project="test",
+        repo=RepoConfig("", "main", str(tmp_path)),
+        work_dir=tmp_path / "work",
+        steps=[StepConfig("train", "Train", "train", queue="gpu")],
+        validation=None,
+        promotion=None,
+        api_key="",
+        server_port=7860,
+        log_dir=tmp_path / "logs",
+    )
+    config.log_dir.mkdir()
+    store = JobStore(tmp_path / "jobs.db")
+    store.create_job("job", ["train"], "v1", stage_queues={"train": "gpu"})
+    original_get_job = store.get_job
+    cancelled = False
+
+    def get_job(job_id: str, field: str | None = None):
+        if cancelled and field == "stages":
+            return None
+        return original_get_job(job_id, field)
+
+    async def cancel(*args, **kwargs):
+        nonlocal cancelled
+        cancelled = True
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(store, "get_job", get_job)
+    monkeypatch.setattr(runner_module, "_run_cmd", cancel)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(JobRunner(store, config).run_job("job"))
+
+
 def test_restart_with_lower_gpu_capacity_fails_job_with_admission_error(
     tmp_path: Path,
 ) -> None:

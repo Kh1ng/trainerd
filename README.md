@@ -290,6 +290,7 @@ must not exceed 2 GiB. Artifact endpoints are unavailable without an API key.
 | `POST /api/jobs` | API key; none in LAN mode | Submit a job |
 | `GET /api/jobs` | API key; none in LAN mode | List recent jobs |
 | `GET /api/jobs/{job_id}` | API key; none in LAN mode | Read job status |
+| `GET /api/queue` | API key; none in LAN mode | Ordered active queue for monitors |
 | `GET /api/jobs/{job_id}/logs` | API key; none in LAN mode | Tail or stream logs |
 | `GET /api/jobs/{job_id}/artifacts` | API key required | List validated job artifacts |
 | `GET /api/jobs/{job_id}/artifacts/{index}` | API key required | Download one validated artifact |

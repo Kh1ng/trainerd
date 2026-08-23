@@ -139,17 +139,19 @@ class JobStore:
             return data.get(field)
         return data
 
-    def list_jobs(self, limit: int = 20, status: str | None = None, *, oldest_first: bool = False) -> list[dict]:
+    def list_jobs(self, limit: int | None = 20, status: str | None = None, *, oldest_first: bool = False) -> list[dict]:
         order = "ASC" if oldest_first else "DESC"
+        limit_sql = "" if limit is None else " LIMIT ?"
         with self._connect() as conn:
             if status:
                 rows = conn.execute(
-                    f"SELECT * FROM jobs WHERE status = ? ORDER BY created_at {order} LIMIT ?",
-                    (status, limit),
+                    f"SELECT * FROM jobs WHERE status = ? ORDER BY created_at {order}{limit_sql}",
+                    (status,) if limit is None else (status, limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    f"SELECT * FROM jobs ORDER BY created_at {order} LIMIT ?", (limit,)
+                    f"SELECT * FROM jobs ORDER BY created_at {order}{limit_sql}",
+                    () if limit is None else (limit,),
                 ).fetchall()
         out = []
         for row in rows:

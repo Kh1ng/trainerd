@@ -41,7 +41,6 @@ from .lan import (
     default_state_dir,
     normalize_repo_url,
     prepare_lan_project,
-    repo_key,
 )
 from .runner import JobRunner, StageQueuePool
 from .storage import JobStore, JobStatus
@@ -63,6 +62,7 @@ class ProjectRuntime:
     store: JobStore
     runner: JobRunner
     lan_repo_key: str | None = None
+    workspace_lock: asyncio.Lock | None = None
 
 
 _server_config: ServerConfig | None = None
@@ -178,6 +178,15 @@ def _is_registry_mode() -> bool:
 
 def _is_lan_mode() -> bool:
     return _lan_mode_active
+
+
+def _daemon_max_concurrent_jobs() -> int:
+    """Daemon-wide concurrency limit for the current mode."""
+    if _is_lan_mode():
+        return _lan_max_concurrent_jobs
+    if _server_config:
+        return _server_config.max_concurrent_jobs
+    return _config.max_concurrent_jobs if _config else 1
 
 
 def _lan_allowed_repo_urls() -> frozenset[str]:
@@ -385,13 +394,7 @@ def _recover_stale_jobs(runtime: ProjectRuntime) -> None:
 
 async def _queue_worker() -> None:
     """Dispatch queued jobs within daemon-wide and per-project limits."""
-    max_jobs = (
-        _lan_max_concurrent_jobs
-        if _is_lan_mode()
-        else _server_config.max_concurrent_jobs
-        if _server_config
-        else (_config.max_concurrent_jobs if _config else 1)
-    )
+    max_jobs = _daemon_max_concurrent_jobs()
     log.info("Queue worker started (max_concurrent_jobs=%s)", max_jobs)
     while True:
         try:
@@ -437,6 +440,7 @@ async def _run_job_wrapper(job_id: str, project: str | None = None) -> None:
                 runtime.store.set_pending(job_id)
             else:
                 runtime.store.set_failed(job_id, "Cancelled via API")
+        raise
     except Exception:
         log.exception("Unexpected error in job %s", job_id)
         runtime.store.set_failed(job_id, "Internal error — see server logs")
@@ -604,13 +608,7 @@ async def health() -> dict:
     pending = sum(len(runtime.store.list_job_ids(status=JobStatus.PENDING)) for runtime in runtimes.values())
     running = sum(len(runtime.store.list_job_ids(status=JobStatus.RUNNING)) for runtime in runtimes.values())
     active = len(set().union(*_active_job_ids_by_project(runtimes).values()))
-    max_jobs = (
-        _lan_max_concurrent_jobs
-        if _is_lan_mode()
-        else _server_config.max_concurrent_jobs
-        if _server_config
-        else (_config.max_concurrent_jobs if _config else 1)
-    )
+    max_jobs = _daemon_max_concurrent_jobs()
     default = _default_project or (_config.project if _config else None)
     return {
         "status": "ok",
@@ -770,19 +768,6 @@ async def _prepare_lan_runtime(
                 status_code=403,
                 detail="Repository is not allowlisted on this trainerd host",
             )
-        selected_key = repo_key(normalized_repo)
-        existing = [
-            runtime
-            for runtime in _projects.values()
-            if runtime.lan_repo_key == selected_key
-        ]
-        if existing and sum(_lan_runtime_load(runtime) for runtime in existing) >= max(
-            runtime.config.max_concurrent_jobs for runtime in existing
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail="This repository has reached its configured concurrent job limit",
-            )
         prepared = await asyncio.to_thread(
             prepare_lan_project,
             _lan_state_dir,
@@ -824,11 +809,20 @@ def _install_lan_runtime(prepared: LanPreparedProject) -> ProjectRuntime:
         return existing
 
     store = JobStore(prepared.config.log_dir / "jobs.db")
+    workspace_lock = next(
+        (
+            runtime.workspace_lock
+            for runtime in _projects.values()
+            if runtime.lan_repo_key == prepared.repo_key
+            and runtime.workspace_lock is not None
+        ),
+        None,
+    ) or asyncio.Lock()
     runner = JobRunner(
         store,
         prepared.config,
         queues=_stage_queues,
-        workspace_lock=_lan_prepare_lock,
+        workspace_lock=workspace_lock,
     )
     runtime = ProjectRuntime(
         prepared.project,
@@ -837,6 +831,7 @@ def _install_lan_runtime(prepared: LanPreparedProject) -> ProjectRuntime:
         store,
         runner,
         lan_repo_key=prepared.repo_key,
+        workspace_lock=workspace_lock,
     )
     _recover_stale_jobs(runtime)
     if repository_load + _lan_runtime_load(runtime) >= prepared.config.max_concurrent_jobs:
@@ -879,6 +874,120 @@ async def list_jobs(limit: int = 20) -> list[dict]:
         for job in store.list_jobs(limit=limit)
     )
     return sorted(jobs, key=lambda job: job.get("created_at") or "", reverse=True)[:limit]
+
+
+def _job_queue_entry(project: str, job: dict) -> dict:
+    """Compact active-queue fields for one job, without secrets or commands."""
+    stages = job.get("stages") or {}
+    steps = job.get("steps") or []
+    status = job.get("status")
+    current_stage = None
+    next_stage = None
+    if stages:
+        for step, stage in stages.items():
+            if stage.get("status") == "running":
+                current_stage = step
+            elif stage.get("status") == "pending" and next_stage is None:
+                next_stage = step
+    elif status == JobStatus.RUNNING:
+        current_stage = job.get("current_step")
+        if current_stage and current_stage in steps:
+            following = steps[steps.index(current_stage) + 1:]
+            if following:
+                next_stage = following[0]
+    elif status == JobStatus.PENDING and steps:
+        next_stage = steps[0]
+    if current_stage is None and status == JobStatus.RUNNING:
+        current_stage = job.get("current_step")
+    stage_id = current_stage or next_stage
+    queue = (stages.get(stage_id) or {}).get("queue") if stage_id else None
+    return {
+        "job_id": job.get("job_id"),
+        "project": project,
+        "version": job.get("version"),
+        "status": status,
+        "current_stage": current_stage,
+        "next_stage": next_stage,
+        "queue": queue,
+        "queue_position": None,
+        "created_at": job.get("created_at"),
+        "started_at": job.get("started_at"),
+        "steps": job.get("steps") or [],
+    }
+
+
+def _scheduler_pending_order() -> list[tuple[ProjectRuntime, dict]]:
+    """Order pending jobs exactly as the queue worker would claim them.
+
+    Jobs the worker can claim right now come first, in global scheduler order
+    (per-project concurrency limits applied). Jobs blocked behind a saturated
+    project follow by age. This keeps queue_position consistent with dispatch
+    order instead of a naive global created_at sort.
+    """
+    runtimes = _runtime_map()
+    claimable = _pending_candidates(_daemon_max_concurrent_jobs())
+    claimable_ids = {(runtime.project, job["job_id"]) for runtime, job in claimable}
+    ordered = list(claimable)
+    deferred: list[tuple[str, ProjectRuntime, dict]] = []
+    for runtime in runtimes.values():
+        for job in runtime.store.list_jobs(
+            status=JobStatus.PENDING, limit=None, oldest_first=True
+        ):
+            if (runtime.project, job["job_id"]) in claimable_ids:
+                continue
+            deferred.append((job.get("created_at") or "", runtime, job))
+    deferred.sort(key=lambda item: item[0])
+    ordered.extend((runtime, job) for _, runtime, job in deferred)
+    return ordered
+
+
+def _active_queue_entries() -> tuple[list[dict], list[dict]]:
+    """Return (running, pending) entries matching health counts.
+
+    Only loaded runtimes contribute. Dormant LAN stores are historical; a job
+    still marked pending or running there is stale, so counting it would make
+    the queue disagree with /api/health.
+    """
+    runtimes = _runtime_map()
+    running: list[dict] = []
+    for runtime in runtimes.values():
+        for job in runtime.store.list_jobs(
+            status=JobStatus.RUNNING, limit=None, oldest_first=True
+        ):
+            running.append(_job_queue_entry(runtime.project, job))
+    running.sort(key=lambda entry: entry.get("started_at") or entry.get("created_at") or "")
+    pending = [
+        _job_queue_entry(runtime.project, job)
+        for runtime, job in _scheduler_pending_order()
+    ]
+    for position, entry in enumerate(pending, start=1):
+        entry["queue_position"] = position
+    return running, pending
+
+
+@app.get("/api/queue", dependencies=[Depends(_read_api_key_auth)])
+async def active_queue() -> dict:
+    """Read-only ordered view of running and pending work for external monitors.
+
+    Running jobs are listed first, oldest start first, followed by pending jobs
+    in scheduler order. Each entry exposes only identifiers, status, stage/queue
+    position, and times - never commands, environment values, or secrets.
+    """
+    runtimes = _runtime_map()
+    for runtime in runtimes.values():
+        _refresh_project_runtime(runtime)
+    running, pending = _active_queue_entries()
+    active = len(set().union(*_active_job_ids_by_project(runtimes).values()))
+    max_jobs = _daemon_max_concurrent_jobs()
+    return {
+        "jobs": running + pending,
+        "pending_jobs": len(pending),
+        "running_jobs": len(running),
+        "max_concurrent_jobs": max_jobs,
+        "queue_capacity": max(max_jobs - active, 0),
+        "stage_queues": _stage_queues.snapshot() if _stage_queues else None,
+        "authentication_required": bool(_configured_api_key()),
+    }
 
 
 @app.get("/api/jobs/{job_id}", dependencies=[Depends(_read_api_key_auth)])
@@ -942,11 +1051,34 @@ async def stream_logs(job_id: str, request: Request, tail: int | None = None) ->
     return StreamingResponse(_generate(), media_type="text/plain")
 
 
+def _find_job_artifact_context(job_id: str) -> tuple[Path, dict] | None:
+    """Return the daemon-owned work directory and job, including after restart."""
+    found = _find_job_runtime(job_id)
+    if found:
+        runtime, job = found
+        return runtime.config.work_dir, job
+    persisted = _find_persisted_lan_job(job_id)
+    if not persisted or _lan_state_dir is None:
+        return None
+    project, _, _, job = persisted
+    match = re.fullmatch(
+        r"lan-([0-9a-f]{20})-([A-Za-z0-9][A-Za-z0-9._-]{0,63})",
+        project,
+    )
+    if not match:
+        return None
+    return _lan_state_dir / "work" / match[1] / match[2], job
+
+
 def _validated_job_artifacts(
-    runtime: ProjectRuntime,
+    work_dir: Path,
     job: dict,
+    artifact_index: int | None = None,
 ) -> tuple[dict[str, Any], list[Path]]:
-    job_root = (runtime.config.work_dir / job["job_id"]).resolve()
+    work_root = work_dir.resolve()
+    job_root = (work_root / job["job_id"]).resolve()
+    if not job_root.is_relative_to(work_root):
+        raise HTTPException(status_code=422, detail="Artifact directory has an invalid path")
     manifest_path = (job_root / "artifact_manifest.json").resolve()
     if not manifest_path.is_relative_to(job_root):
         raise HTTPException(status_code=422, detail="Artifact manifest has an invalid path")
@@ -973,8 +1105,12 @@ def _validated_job_artifacts(
     if sum(declared_bytes) > _MAX_ARTIFACT_BYTES:
         raise HTTPException(status_code=413, detail="Declared artifacts are too large")
 
+    if artifact_index is not None and not 0 <= artifact_index < len(entries):
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    selected = range(len(entries)) if artifact_index is None else (artifact_index,)
     paths: list[Path] = []
-    for index, entry in enumerate(entries):
+    for index in selected:
+        entry = entries[index]
         try:
             relative = Path(entry["path"])
             path = (job_root / relative).resolve()
@@ -1006,11 +1142,11 @@ def _validated_job_artifacts(
 
 @app.get("/api/jobs/{job_id}/artifacts", dependencies=[Depends(_required_api_key_auth)])
 async def list_job_artifacts(job_id: str) -> dict:
-    found = _find_job_runtime(job_id)
-    if not found:
+    context = _find_job_artifact_context(job_id)
+    if not context:
         raise HTTPException(status_code=404, detail="Job not found")
-    runtime, job = found
-    manifest, _ = await asyncio.to_thread(_validated_job_artifacts, runtime, job)
+    work_dir, job = context
+    manifest, _ = await asyncio.to_thread(_validated_job_artifacts, work_dir, job)
     return {
         **manifest,
         "artifacts": [
@@ -1025,14 +1161,14 @@ async def list_job_artifacts(job_id: str) -> dict:
 
 @app.get("/api/jobs/{job_id}/artifacts/{artifact_index}", dependencies=[Depends(_required_api_key_auth)])
 async def download_job_artifact(job_id: str, artifact_index: int) -> Response:
-    found = _find_job_runtime(job_id)
-    if not found:
+    context = _find_job_artifact_context(job_id)
+    if not context:
         raise HTTPException(status_code=404, detail="Job not found")
-    runtime, job = found
-    _, paths = await asyncio.to_thread(_validated_job_artifacts, runtime, job)
-    if artifact_index < 0 or artifact_index >= len(paths):
-        raise HTTPException(status_code=404, detail="Artifact not found")
-    return FileResponse(paths[artifact_index], filename=paths[artifact_index].name)
+    work_dir, job = context
+    _, paths = await asyncio.to_thread(
+        _validated_job_artifacts, work_dir, job, artifact_index
+    )
+    return FileResponse(paths[0], filename=paths[0].name)
 
 
 @app.delete("/api/jobs/{job_id}", dependencies=[Depends(_api_key_auth)])
