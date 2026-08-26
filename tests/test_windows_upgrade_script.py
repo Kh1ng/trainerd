@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
+import shutil
 import socket
 import subprocess
-import sys
+from pathlib import Path
 
 import pytest
 
@@ -103,8 +103,9 @@ def test_upgrade_script_kills_console_launcher_process_tree(tmp_path: Path) -> N
         text.index("function Get-HealthJson"):
         text.index("function Stop-DaemonTask")
     ]
-    trainerd_exe = Path(sys.executable).with_name("trainerd.exe")
-    assert trainerd_exe.is_file(), f"missing installed console script {trainerd_exe}"
+    trainerd_command = shutil.which("trainerd")
+    assert trainerd_command, "missing installed trainerd console script"
+    trainerd_exe = Path(trainerd_command)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
