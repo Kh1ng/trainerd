@@ -120,8 +120,9 @@ def test_upgrade_script_kills_console_launcher_process_tree(tmp_path: Path) -> N
 $HealthUrl = 'http://127.0.0.1:{port}'
 $trainerdExe = '{quoted(str(trainerd_exe))}'
 $stateDir = '{quoted(str(state_dir))}'
+$arguments = 'serve --lan --state-dir "' + $stateDir + '" --host 127.0.0.1 --port {port}'
 $launcher = Start-Process -FilePath $trainerdExe `
-    -ArgumentList 'serve --lan --state-dir "' + $stateDir + '" --host 127.0.0.1 --port {port}' `
+    -ArgumentList $arguments `
     -PassThru
 try {{
     if (-not (Wait-For-Health -BaseUrl $HealthUrl -ExpectedVersion '{__import__('trainerd').__version__}' -Attempts 30 -DelaySeconds 1)) {{
@@ -135,7 +136,7 @@ try {{
     if (Get-HealthJson -BaseUrl $HealthUrl) {{ throw 'Trainerd listener remained alive.' }}
 }}
 finally {{
-    if (-not $launcher.HasExited) {{ taskkill.exe /PID $launcher.Id /T /F | Out-Null }}
+    if ($launcher -and -not $launcher.HasExited) {{ taskkill.exe /PID $launcher.Id /T /F | Out-Null }}
 }}
 """,
         encoding="utf-8",

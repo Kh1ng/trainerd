@@ -918,6 +918,7 @@ def test_lan_recovers_pending_job_runtime_before_queue_start(
     )
     monkeypatch.setenv("TRAINERD_LAN_MODE", "1")
     monkeypatch.setenv("TRAINERD_STATE_DIR", str(state_dir))
+    monkeypatch.delenv("TRAINERD_API_KEY", raising=False)
     monkeypatch.delenv("TRAINERD_ALLOWED_REPOS", raising=False)
     server._runtime.reset()
 
