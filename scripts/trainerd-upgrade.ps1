@@ -245,6 +245,111 @@ function Get-VerifiedTrainerdListenerProcess {
     return $process
 }
 
+function Get-VerifiedTrainerdProcessRoot {
+    param(
+        [object]$Listener,
+        [string]$ExpectedExecutable
+    )
+    try {
+        $expectedPath = (Get-Item -LiteralPath $ExpectedExecutable -ErrorAction Stop).FullName
+    }
+    catch {
+        return $null
+    }
+    $process = $Listener
+    $visited = @{}
+    while ($process) {
+        $processId = [int]$process.ProcessId
+        if ($visited.ContainsKey($processId)) {
+            return $null
+        }
+        $visited[$processId] = $true
+        if (
+            $process.ExecutablePath -and
+            [IO.Path]::GetFullPath($process.ExecutablePath) -ieq $expectedPath
+        ) {
+            return $process
+        }
+        $parentPid = [int]$process.ParentProcessId
+        if ($parentPid -le 0) {
+            return $null
+        }
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId = $parentPid"
+    }
+    return $null
+}
+
+function Get-VerifiedTrainerdProcessTree {
+    param([string]$ExpectedExecutable)
+    $listener = Get-VerifiedTrainerdListenerProcess
+    if (-not $listener) {
+        return @()
+    }
+    $root = Get-VerifiedTrainerdProcessRoot `
+        -Listener $listener `
+        -ExpectedExecutable $ExpectedExecutable
+    if (-not $root) {
+        return @()
+    }
+    $allProcesses = @(Get-CimInstance Win32_Process)
+    $treeIds = @([int]$root.ProcessId)
+    do {
+        $children = @(
+            $allProcesses |
+                Where-Object {
+                    $treeIds -contains [int]$_.ParentProcessId -and
+                    $treeIds -notcontains [int]$_.ProcessId
+                } |
+                Select-Object -ExpandProperty ProcessId
+        )
+        $treeIds += $children
+    } while ($children.Count -gt 0)
+    return @($allProcesses | Where-Object { $treeIds -contains [int]$_.ProcessId })
+}
+
+function Stop-VerifiedTrainerdProcessTree {
+    param([object[]]$VerifiedProcesses)
+    $verified = @{}
+    foreach ($process in $VerifiedProcesses) {
+        $verified[[int]$process.ProcessId] = [string]$process.CreationDate
+    }
+    $currentProcesses = @(
+        Get-CimInstance Win32_Process |
+            Where-Object {
+                $currentProcessId = [int]$_.ProcessId
+                $verified.ContainsKey($currentProcessId) -and
+                $verified[$currentProcessId] -ceq [string]$_.CreationDate
+            }
+    )
+    if ($currentProcesses.Count -eq 0) {
+        return $true
+    }
+    $currentIds = @($currentProcesses | Select-Object -ExpandProperty ProcessId)
+    $roots = @(
+        $currentProcesses |
+            Where-Object { $currentIds -notcontains [int]$_.ParentProcessId }
+    )
+    foreach ($root in $roots) {
+        $rootPid = [int]$root.ProcessId
+        & taskkill.exe /PID $rootPid /T /F | Out-Null
+    }
+    for ($i = 0; $i -lt 10; $i++) {
+        $remaining = @(
+            Get-CimInstance Win32_Process |
+                Where-Object {
+                    $currentProcessId = [int]$_.ProcessId
+                    $verified.ContainsKey($currentProcessId) -and
+                    $verified[$currentProcessId] -ceq [string]$_.CreationDate
+                }
+        )
+        if ($remaining.Count -eq 0) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    return $false
+}
+
 function Assert-LegacyLanConfig {
     param([string]$ConfigPath)
     $config = Get-Item -LiteralPath $ConfigPath -ErrorAction Stop
@@ -264,7 +369,11 @@ function Assert-LegacyLanConfig {
 }
 
 function Stop-VerifiedTrainerdListener {
-    param([string]$ExpectedVersion)
+    param(
+        [string]$ExpectedVersion,
+        [string]$ExpectedExecutable,
+        [object[]]$VerifiedProcesses = @()
+    )
     $health = Get-HealthJson -BaseUrl $HealthUrl
     if (
         -not $health -or
@@ -279,21 +388,44 @@ function Stop-VerifiedTrainerdListener {
     if (-not $process) {
         return $false
     }
-    $listenerPid = [int]$process.ProcessId
-    Stop-Process -Id $listenerPid -Force -ErrorAction Stop
-    return $true
+    if ($VerifiedProcesses.Count -eq 0) {
+        $VerifiedProcesses = @(
+            Get-VerifiedTrainerdProcessTree -ExpectedExecutable $ExpectedExecutable
+        )
+    }
+    if (
+        $VerifiedProcesses.Count -eq 0 -or
+        $VerifiedProcesses.ProcessId -notcontains [int]$process.ProcessId
+    ) {
+        return $false
+    }
+    return Stop-VerifiedTrainerdProcessTree -VerifiedProcesses $VerifiedProcesses
 }
 
 function Stop-DaemonTask {
-    param([string]$ExpectedVersion)
+    param(
+        [string]$ExpectedVersion,
+        [string]$ExpectedExecutable
+    )
+    $verifiedProcesses = @(
+        Get-VerifiedTrainerdProcessTree -ExpectedExecutable $ExpectedExecutable
+    )
+    if ($verifiedProcesses.Count -eq 0) {
+        return $false
+    }
     Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop
     for ($i = 0; $i -lt 15; $i++) {
         if (-not (Get-HealthJson -BaseUrl $HealthUrl)) {
-            return $true
+            return Stop-VerifiedTrainerdProcessTree `
+                -VerifiedProcesses $verifiedProcesses
         }
         Start-Sleep -Seconds 2
     }
-    if (-not (Stop-VerifiedTrainerdListener -ExpectedVersion $ExpectedVersion)) {
+    if (-not (Stop-VerifiedTrainerdListener `
+        -ExpectedVersion $ExpectedVersion `
+        -ExpectedExecutable $ExpectedExecutable `
+        -VerifiedProcesses $verifiedProcesses
+    )) {
         return $false
     }
     for ($i = 0; $i -lt 15; $i++) {
@@ -312,7 +444,7 @@ function Restore-PriorAction {
         [string]$WorkingDirectory,
         [string]$ExpectedVersion
     )
-    if (-not (Stop-DaemonTask -ExpectedVersion $ExpectedVersion)) {
+    if (-not (Stop-DaemonTask -ExpectedVersion $ExpectedVersion -ExpectedExecutable $trainerdExe)) {
         return $false
     }
     $actionParameters = @{
@@ -468,7 +600,7 @@ if ($queue.Pending -gt 0 -or $queue.Running -gt 0) {
 Write-Host "Stopping task $TaskName and switching to $Version ..."
 $taskActionChanged = $false
 try {
-    if (-not (Stop-DaemonTask -ExpectedVersion $priorVersion)) {
+    if (-not (Stop-DaemonTask -ExpectedVersion $priorVersion -ExpectedExecutable $priorExecute)) {
         throw "The old daemon did not release its port. Its listener did not pass the trainerd identity and empty-queue checks."
     }
     Set-ScheduledTask -TaskName $TaskName -Action $newAction -ErrorAction Stop

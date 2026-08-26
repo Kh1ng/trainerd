@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
+import shutil
+import socket
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -79,10 +81,81 @@ def test_upgrade_script_stops_only_a_verified_trainerd_listener() -> None:
     assert "$process.CommandLine" in text
     assert "$health.version -ne $ExpectedVersion" in text
     assert "$health.pending_jobs -gt 0 -or $health.running_jobs -gt 0" in text
-    assert "Stop-Process -Id $listenerPid" in text
-    # Must never kill a process by executable name.
-    assert "taskkill" not in text
+    assert "Get-VerifiedTrainerdProcessRoot" in text
+    assert "Get-VerifiedTrainerdProcessTree" in text
+    assert "ExpectedExecutable" in text
+    assert 'taskkill.exe /PID $rootPid /T /F' in text
     assert "Get-Process" not in text
+
+    stop_task = text.split("function Stop-DaemonTask", 1)[1].split(
+        "function Restore-PriorAction", 1
+    )[0]
+    assert stop_task.index("Get-VerifiedTrainerdProcessTree") < stop_task.index(
+        "Stop-ScheduledTask"
+    )
+    assert "Stop-VerifiedTrainerdProcessTree" in stop_task
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows PowerShell regression")
+def test_upgrade_script_kills_console_launcher_process_tree(tmp_path: Path) -> None:
+    text = _script_text()
+    functions = text[
+        text.index("function Get-HealthJson"):
+        text.index("function Stop-DaemonTask")
+    ]
+    trainerd_command = shutil.which("trainerd")
+    assert trainerd_command, "missing installed trainerd console script"
+    trainerd_exe = Path(trainerd_command)
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+
+    def quoted(value: str) -> str:
+        return value.replace("'", "''")
+
+    state_dir = tmp_path / "state"
+    harness = tmp_path / "process-tree.ps1"
+    harness.write_text(
+        functions
+        + f"""
+$HealthUrl = 'http://127.0.0.1:{port}'
+$trainerdExe = '{quoted(str(trainerd_exe))}'
+$stateDir = '{quoted(str(state_dir))}'
+$arguments = 'serve --lan --state-dir "' + $stateDir + '" --host 127.0.0.1 --port {port}'
+$launcher = Start-Process -FilePath $trainerdExe `
+    -ArgumentList $arguments `
+    -PassThru
+try {{
+    if (-not (Wait-For-Health -BaseUrl $HealthUrl -ExpectedVersion '{__import__('trainerd').__version__}' -Attempts 30 -DelaySeconds 1)) {{
+        throw 'Console-script daemon did not start.'
+    }}
+    if (-not (Stop-VerifiedTrainerdListener -ExpectedVersion '{__import__('trainerd').__version__}' -ExpectedExecutable $trainerdExe)) {{
+        throw 'Verified console-script process tree was not stopped.'
+    }}
+    $launcher.WaitForExit(5000) | Out-Null
+    if (-not $launcher.HasExited) {{ throw 'Console-script launcher remained alive.' }}
+    if (Get-HealthJson -BaseUrl $HealthUrl) {{ throw 'Trainerd listener remained alive.' }}
+}}
+finally {{
+    if ($launcher -and -not $launcher.HasExited) {{ taskkill.exe /PID $launcher.Id /T /F | Out-Null }}
+}}
+""",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(harness),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
 
 
 def test_upgrade_script_requires_explicit_live_and_probe_arguments() -> None:

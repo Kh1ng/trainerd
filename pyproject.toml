@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trainerd"
-version = "0.3.13"
+version = "0.3.14"
 description = "Allowlisted HTTP job runner for trusted, queued subprocess workloads"
 readme = "README.md"
 license = "MIT"
@@ -27,6 +27,7 @@ classifiers = [
 ]
 dependencies = [
   "fastapi>=0.111,<1",
+  "mcp>=2,<3",
   "pydantic>=2,<3",
   "uvicorn>=0.29,<1",
   "PyYAML>=6.0,<7",
