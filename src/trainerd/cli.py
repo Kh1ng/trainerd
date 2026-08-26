@@ -202,6 +202,16 @@ def _cmd_submit(args: argparse.Namespace) -> int:
     return _cmd_watch(watch_args)
 
 
+def _cmd_mcp(args: argparse.Namespace) -> int:
+    server_url = args.server_url or os.environ.get("TRAINERD_SERVER_URL")
+    if not server_url:
+        raise ProfileError("mcp requires --server-url or TRAINERD_SERVER_URL")
+    from .mcp import run
+
+    run(server_url, os.environ.get("TRAINERD_API_KEY", ""))
+    return 0
+
+
 def _cmd_profile_set(args: argparse.Namespace) -> int:
     set_profile(args.name, args.server_url, args.project)
     print(f"{args.name} configured")
@@ -373,6 +383,10 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--log-tail-lines", type=int, default=200)
     submit.add_argument("--log-timeout-seconds", type=int, default=10)
     submit.set_defaults(func=_cmd_submit)
+
+    mcp = sub.add_parser("mcp", help="Expose a trainerd server as MCP tools over stdio")
+    mcp.add_argument("--server-url")
+    mcp.set_defaults(func=_cmd_mcp)
 
     profile = sub.add_parser("profile", help="Manage non-secret client connection profiles")
     profile_sub = profile.add_subparsers(dest="profile_command", required=True)

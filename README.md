@@ -370,6 +370,32 @@ must not exceed 2 GiB. Artifact endpoints are unavailable without an API key.
 
 Interactive OpenAPI documentation is available at `/docs`.
 
+## MCP server
+
+Run the MCP adapter on the agent host. The adapter calls the existing Trainerd
+HTTP API and does not contain a second queue.
+
+```json
+{
+  "mcpServers": {
+    "trainerd": {
+      "command": "trainerd",
+      "args": ["mcp"],
+      "env": {
+        "TRAINERD_SERVER_URL": "http://trainerd-host:7860",
+        "TRAINERD_API_KEY": "replace-with-the-daemon-api-key"
+      }
+    }
+  }
+}
+```
+
+The MCP tools can list jobs, read status, read bounded logs, and list artifact
+metadata. They can also submit, cancel, and promote jobs.
+
+The adapter does not include the API key in a tool schema or tool argument.
+Log output has a limit of 500 lines and 100,000 bytes for each call.
+
 ## Windows daemon
 
 Install `trainerd` in a dedicated daemon virtual environment, separate from all
@@ -424,8 +450,8 @@ production arguments and isolated probe arguments. The probe must keep the same
 authentication and repository policy.
 
 ```powershell
-.\scripts\trainerd-upgrade.ps1 -Version 0.3.13 `
-  -WheelUrl https://github.com/Kh1ng/trainerd/releases/download/v0.3.13/trainerd-0.3.13-py3-none-any.whl `
+.\scripts\trainerd-upgrade.ps1 -Version 0.3.14 `
+  -WheelUrl https://github.com/Kh1ng/trainerd/releases/download/v0.3.14/trainerd-0.3.14-py3-none-any.whl `
   -ServeArguments '--lan --lan-config "C:\ProgramData\trainerd\lan.yaml" --state-dir "C:\ProgramData\trainerd\state" --host 0.0.0.0 --port 7860' `
   -ProbeArguments '--lan --lan-config "C:\ProgramData\trainerd\lan.yaml" --state-dir "{probe_state_dir}" --host 127.0.0.1 --port {probe_port}'
 ```
@@ -438,10 +464,13 @@ The helper compares the mode, authentication requirement, and complete LAN
 policy hash before cutover. Loaded project history does not affect this hash.
 
 The replacement Scheduled Task runs `trainerd.exe serve` directly. The helper
-first stops the Scheduled Task. If Trainerd remains, the helper can stop only
-the process that owns the Trainerd port. The process must match the prior
-version, an empty queue, and a `trainerd serve` command line. The helper does
-not stop a process that fails one of these checks.
+first stops the Scheduled Task. If Trainerd remains, the helper identifies the
+process that owns the Trainerd port. The process must match the prior version,
+an empty queue, and a `trainerd serve` command line.
+
+The helper then follows the parent process chain to the Scheduled Task
+executable. It stops that root and all child processes. The helper does not
+stop a process tree if the executable does not match the Scheduled Task action.
 
 If the switch fails, the helper restores the prior task action. It also checks
 the prior version after rollback. The probe writes separate versioned output
